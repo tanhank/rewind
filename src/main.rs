@@ -25,7 +25,7 @@ use rewind::undo;
 commands, stages their pre-action state, and lets you reverse them.\n\n\
 Shell integration:\n  bash   echo 'eval \"$(rewind init bash)\"' >> ~/.bashrc\n  zsh    echo 'eval \"$(rewind init zsh)\"' >> ~/.zshrc\n  fish   echo 'rewind init fish | source' >> ~/.config/fish/config.fish\n\n\
 Then run `rewind undo`, `rewind log`, and `rewind status`.",
-    after_help = "Docs: https://github.com/janghotan/rewind"
+    after_help = "Docs: https://github.com/tanhank/rewind"
 )]
 struct Cli {
     #[command(subcommand)]

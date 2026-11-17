@@ -5,7 +5,7 @@ Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Universal undo for destructive shell commands
 License:        MIT
-URL:            https://github.com/janghotan/rewind
+URL:            https://github.com/tanhank/rewind
 Source0:        %{url}/archive/refs/tags/v%{version}/%{name}-%{version}.tar.gz
 # Generated with `cargo vendor`; see packaging/README.md.
 Source1:        %{name}-%{version}-vendor.tar.xz
@@ -75,16 +75,16 @@ install -d %{buildroot}%{_datadir}/fish/vendor_completions.d
 %{_datadir}/fish/vendor_completions.d/rewind.fish
 
 %changelog
-* Tue Oct 27 2026 janghotan <janghotan@users.noreply.github.com> - 0.2.0-1
+* Tue Oct 27 2026 janghotan <tanhank@users.noreply.github.com> - 0.2.0-1
 - New upstream release.
 - Add `rewind inspect` command.
 - Restore empty directories on `git clean` undo.
 - Add undo support for `git branch -D`.
 
-* Thu Oct 22 2026 janghotan <janghotan@users.noreply.github.com> - 0.1.1-1
+* Thu Oct 22 2026 janghotan <tanhank@users.noreply.github.com> - 0.1.1-1
 - New upstream release.
 - Add static Debian package tooling and signed APT repository automation.
 - Refresh the English and Simplified Chinese documentation.
 
-* Wed Oct 21 2026 janghotan <janghotan@users.noreply.github.com> - 0.1.0-1
+* Wed Oct 21 2026 janghotan <tanhank@users.noreply.github.com> - 0.1.0-1
 - Initial package.

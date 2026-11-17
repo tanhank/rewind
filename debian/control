@@ -1,7 +1,7 @@
 Source: rewind
 Section: utils
 Priority: optional
-Maintainer: janghotan <janghotan@users.noreply.github.com>
+Maintainer: tanhank <tanhank@users.noreply.github.com>
 Build-Depends:
  cargo,
  debhelper-compat (= 13),
@@ -9,9 +9,9 @@ Build-Depends:
  git,
  rustc (>= 1.85),
 Standards-Version: 4.7.0
-Homepage: https://github.com/janghotan/rewind
-Vcs-Git: https://github.com/janghotan/rewind.git
-Vcs-Browser: https://github.com/janghotan/rewind
+Homepage: https://github.com/tanhank/rewind
+Vcs-Git: https://github.com/tanhank/rewind.git
+Vcs-Browser: https://github.com/tanhank/rewind
 Rules-Requires-Root: no
 
 Package: rewind

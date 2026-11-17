@@ -65,7 +65,7 @@ convert -size 1280x640 xc:'#080b0f' \
     -annotate +484+487 'chown' \
     -annotate +600+487 'git' \
     \
-    -font "$mono_regular" -pointsize 17 -fill '#5d6f80' -annotate +76+604 'github.com/janghotan/rewind' \
+    -font "$mono_regular" -pointsize 17 -fill '#5d6f80' -annotate +76+604 'github.com/tanhank/rewind' \
     -annotate +1128+604 'MIT' \
     "$out"
 

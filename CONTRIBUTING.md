@@ -20,7 +20,7 @@ Requires Rust 1.85+ and a C toolchain (for the bundled SQLite used by
 `rusqlite`).
 
 ```bash
-git clone https://github.com/janghotan/rewind
+git clone https://github.com/tanhank/rewind
 cd rewind
 cargo build
 cargo test

@@ -74,14 +74,14 @@ mock -r fedora-44-x86_64 --rebuild packaging/rpmbuild/SRPMS/rewind-*.src.rpm
 The production Debian/Ubuntu channel is a signed flat APT repository served
 from GitHub Pages:
 
-- Site: <https://janghotan.github.io/apt/>
-- Repository: <https://github.com/janghotan/apt> (`gh-pages` branch)
+- Site: <https://tanhank.github.io/apt/>
+- Repository: <https://github.com/tanhank/apt> (`gh-pages` branch)
 - Architectures: `amd64`, `arm64`
 - Packages: statically linked musl binaries built by
   `packaging/build-static-deb.sh`, so they have no runtime dependencies
 
 The signing key lives in the `APT_SIGNING_KEY` secret of this repository; the
-`APT_DEPLOY_KEY` secret is a write-enabled deploy key for `janghotan/apt`.
+`APT_DEPLOY_KEY` secret is a write-enabled deploy key for `tanhank/apt`.
 Both are used by `.github/workflows/apt.yml`, which the release workflow calls
 after publishing a GitHub Release.
 
@@ -95,7 +95,7 @@ To update the repository from a workstation:
 
 ```bash
 export GNUPGHOME=/path/to/apt-signing-key
-git clone --branch gh-pages git@github.com:janghotan/apt.git
+git clone --branch gh-pages git@github.com:tanhank/apt.git
 cd apt
 ./publish.sh /path/to/rewind_<version>-1_amd64.deb /path/to/rewind_<version>-1_arm64.deb
 git commit -am "apt: publish <version>"

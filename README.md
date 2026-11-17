@@ -4,9 +4,9 @@
   <p><strong>Undo for destructive shell commands.</strong></p>
   <p><code>rm</code> · <code>mv</code> · <code>cp</code> · <code>chmod</code> · <code>chown</code> · destructive <code>git</code></p>
 
-  [![CI](https://img.shields.io/github/actions/workflow/status/janghotan/rewind/ci.yml?style=flat-square&label=CI)](https://github.com/janghotan/rewind/actions/workflows/ci.yml)
-  [![Release](https://img.shields.io/github/v/release/janghotan/rewind?style=flat-square&color=34d399)](https://github.com/janghotan/rewind/releases/latest)
-  [![APT repository](https://img.shields.io/badge/APT-repository-34d399?style=flat-square)](https://janghotan.github.io/apt/)
+  [![CI](https://img.shields.io/github/actions/workflow/status/tanhank/rewind/ci.yml?style=flat-square&label=CI)](https://github.com/tanhank/rewind/actions/workflows/ci.yml)
+  [![Release](https://img.shields.io/github/v/release/tanhank/rewind?style=flat-square&color=34d399)](https://github.com/tanhank/rewind/releases/latest)
+  [![APT repository](https://img.shields.io/badge/APT-repository-34d399?style=flat-square)](https://tanhank.github.io/apt/)
   [![COPR](https://img.shields.io/badge/COPR-janghotan%2Frewind-51a2da?style=flat-square)](https://copr.fedorainfracloud.org/coprs/janghotan/rewind/)
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
@@ -53,7 +53,7 @@ The fastest install is the static Linux binary:
 ```bash
 set -o pipefail
 install -d -m 0755 "$HOME/.local/bin" &&
-curl -fsSL https://github.com/janghotan/rewind/releases/latest/download/rewind-x86_64-unknown-linux-musl.tar.gz |
+curl -fsSL https://github.com/tanhank/rewind/releases/latest/download/rewind-x86_64-unknown-linux-musl.tar.gz |
   tar -xz --strip-components=1 --wildcards -C "$HOME/.local/bin" 'rewind-*/rewind' &&
 "$HOME/.local/bin/rewind" --version
 ```
@@ -66,7 +66,7 @@ Replace `x86_64` with `aarch64` in the URL on ARM64. Release binaries are static
 **macOS / Homebrew**
 
 ```bash
-brew install janghotan/tap/rewind
+brew install tanhank/tap/rewind
 ```
 
 Homebrew installs completions for Bash, Zsh, and Fish automatically. Shell integration (command interception) is not enabled automatically and must be added to your shell startup file using `rewind init` (see [Enable the shell hook](#enable-the-shell-hook) below).
@@ -82,27 +82,27 @@ sudo dnf install rewind
 
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://janghotan.github.io/apt/rewind-archive-keyring.gpg \
+curl -fsSL https://tanhank.github.io/apt/rewind-archive-keyring.gpg \
   | sudo tee /etc/apt/keyrings/rewind.gpg >/dev/null
-echo "deb [signed-by=/etc/apt/keyrings/rewind.gpg] https://janghotan.github.io/apt stable main" \
+echo "deb [signed-by=/etc/apt/keyrings/rewind.gpg] https://tanhank.github.io/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/rewind.list
 sudo apt update && sudo apt install rewind
 ```
 
-The APT repository carries static `amd64` and `arm64` packages and works across Debian and Ubuntu releases. Browse it at <https://janghotan.github.io/apt/>.
+The APT repository carries static `amd64` and `arm64` packages and works across Debian and Ubuntu releases. Browse it at <https://tanhank.github.io/apt/>.
 
 Distro packages install the hooks under `/usr/share/rewind/` and completions in the standard shell directories.
 
 **Cargo** requires Rust 1.85 or newer:
 
 ```bash
-cargo install --git https://github.com/janghotan/rewind --locked
+cargo install --git https://github.com/tanhank/rewind --locked
 ```
 
 **From source**
 
 ```bash
-git clone https://github.com/janghotan/rewind
+git clone https://github.com/tanhank/rewind
 cd rewind
 cargo build --release
 install -Dm755 target/release/rewind ~/.local/bin/rewind
@@ -381,4 +381,4 @@ cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 ```
 
-<p align="center"><sub>MIT licensed · <a href="https://github.com/janghotan/rewind">github.com/janghotan/rewind</a></sub></p>
+<p align="center"><sub>MIT licensed · <a href="https://github.com/tanhank/rewind">github.com/tanhank/rewind</a></sub></p>

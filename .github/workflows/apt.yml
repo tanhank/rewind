@@ -96,10 +96,10 @@ jobs:
       - name: Publish repository
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch gh-pages git@github.com:janghotan/apt.git apt-repo
+          git clone --depth 1 --branch gh-pages git@github.com:tanhank/apt.git apt-repo
           cd apt-repo
           git config user.name "rewind release bot"
-          git config user.email "janghotan@users.noreply.github.com"
+          git config user.email "tanhank@users.noreply.github.com"
           ./publish.sh "$GITHUB_WORKSPACE"/apt-debs/*.deb
           git add -A
           if git diff --cached --quiet; then

@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: rewind
-Upstream-Contact: janghotan <janghotan@users.noreply.github.com>
-Source: https://github.com/janghotan/rewind
+Upstream-Contact: tanhank <tanhank@users.noreply.github.com>
+Source: https://github.com/tanhank/rewind
 
 Files: *
 Copyright: 2026 janghotan

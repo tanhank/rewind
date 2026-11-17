@@ -5,7 +5,7 @@ rewind (0.2.0-1) resolute; urgency=medium
   * Add undo support for local Git branch deletion (`git branch -d` / `-D`).
   * Update shell hooks for bash, zsh, and fish to support branch deletion.
 
- -- janghotan <janghotan@users.noreply.github.com>  Tue, 27 Oct 2026 14:00:00 +0000
+ -- janghotan <tanhank@users.noreply.github.com>  Tue, 27 Oct 2026 14:00:00 +0000
 
 rewind (0.1.1-1) resolute; urgency=medium
 
@@ -13,10 +13,10 @@ rewind (0.1.1-1) resolute; urgency=medium
   * Add static .deb packaging for the signed APT repository.
   * Add Simplified Chinese documentation and refresh both READMEs.
 
- -- janghotan <janghotan@users.noreply.github.com>  Thu, 22 Oct 2026 08:55:00 +0000
+ -- janghotan <tanhank@users.noreply.github.com>  Thu, 22 Oct 2026 08:55:00 +0000
 
 rewind (0.1.0-1) resolute; urgency=medium
 
   * Initial release.
 
- -- janghotan <janghotan@users.noreply.github.com>  Wed, 21 Oct 2026 12:00:00 +0000
+ -- janghotan <tanhank@users.noreply.github.com>  Wed, 21 Oct 2026 12:00:00 +0000

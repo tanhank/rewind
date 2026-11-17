@@ -27,7 +27,7 @@ Distribution and documentation release. No runtime behavior changes.
 
 ### Added
 
-- Signed APT repository at <https://janghotan.github.io/apt/> with
+- Signed APT repository at <https://tanhank.github.io/apt/> with
   statically linked `amd64` and `arm64` packages.
 - `packaging/build-static-deb.sh` for building dependency-free `.deb`
   packages from the musl release binaries.
@@ -96,7 +96,7 @@ First public release.
 - **Packaging**: RPM spec for Fedora/COPR and Debian packaging for
   Debian/Ubuntu, including shell completion and hook installation.
 
-[Unreleased]: https://github.com/janghotan/rewind/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/janghotan/rewind/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/janghotan/rewind/releases/tag/v0.1.1
-[0.1.0]: https://github.com/janghotan/rewind/releases/tag/v0.1.0
+[Unreleased]: https://github.com/tanhank/rewind/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/tanhank/rewind/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/tanhank/rewind/releases/tag/v0.1.1
+[0.1.0]: https://github.com/tanhank/rewind/releases/tag/v0.1.0

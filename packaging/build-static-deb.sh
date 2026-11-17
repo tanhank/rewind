@@ -64,11 +64,11 @@ cat > "$stage/DEBIAN/control" <<EOF
 Package: rewind
 Version: ${version}-1
 Architecture: ${arch}
-Maintainer: janghotan <janghotan@users.noreply.github.com>
+Maintainer: tanhank <tanhank@users.noreply.github.com>
 Installed-Size: ${size}
 Section: utils
 Priority: optional
-Homepage: https://github.com/janghotan/rewind
+Homepage: https://github.com/tanhank/rewind
 Description: universal undo for destructive shell commands
  rewind sits between your shell and commands that destroy state. It stages
  the pre-action state of rm, mv, cp, chmod, chown, git reset --hard, git

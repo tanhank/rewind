@@ -131,7 +131,7 @@ impl Config {
             .map_err(|err| Error::Config(format!("serializing config: {err}")))?;
         let header = "\
 # rewind configuration
-# Docs: https://github.com/janghotan/rewind#configuration
+# Docs: https://github.com/tanhank/rewind#configuration
 # Changes take effect on the next wrapped command.
 
 ";
