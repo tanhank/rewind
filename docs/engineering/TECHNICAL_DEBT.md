@@ -1,7 +1,7 @@
 # Technical Debt & Architecture Roadmap: rewind
 
 > **Document Version:** 1.10.0  
-> **Target Software Release Version:** `0.2.0`  
+> **Target Software Release Version:** `0.3.0`  
 > **Commit SHA:** `08a325fc468709928f8e7f5401b418a69d253d66` (+ Phases 2-10 Hardening)  
 > **Classification:** Engineering Assessment & Prioritized Debt Register
 

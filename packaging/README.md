@@ -18,8 +18,8 @@ All packaging derives its version from `Cargo.toml` and `debian/changelog`.
 When releasing, update both and add a `CHANGELOG.md` entry:
 
 ```bash
-# Cargo.toml: version = "0.2.0"
-dch -v 0.2.0-1 "rewind 0.2.0"
+# Cargo.toml: version = "0.3.0"
+dch -v 0.3.0-1 "rewind 0.3.0"
 ```
 
 ## RPM (Fedora, RHEL, COPR)

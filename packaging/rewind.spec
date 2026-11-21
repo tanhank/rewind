@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           rewind
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Universal undo for destructive shell commands
 License:        MIT
@@ -76,6 +76,13 @@ install -d %{buildroot}%{_datadir}/fish/vendor_completions.d
 %{_datadir}/fish/vendor_completions.d/rewind.fish
 
 %changelog
+* Sat Nov 21 2026 Hank Tan <tanhank@users.noreply.github.com> - 0.3.0-1
+- Production release 0.3.0
+- Filesystem security, multi-process locking, sensitive secret redaction.
+- Snapshot isolation, storage reservations, expanded Git recovery and worktrees.
+- Performance optimization, Unix-native CLI with JSON output and completions.
+- Debian, RPM, musl static, and macOS release automation.
+
 * Tue Oct 27 2026 janghotan <tanhank@users.noreply.github.com> - 0.2.0-1
 - New upstream release.
 - Add `rewind inspect` command.

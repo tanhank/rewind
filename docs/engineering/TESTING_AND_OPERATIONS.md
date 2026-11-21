@@ -1,7 +1,7 @@
 # Testing & Operations Guide: rewind
 
 > **Document Version:** 1.10.0  
-> **Target Software Release Version:** `0.2.0`  
+> **Target Software Release Version:** `0.3.0`  
 > **Commit SHA:** `08a325fc468709928f8e7f5401b418a69d253d66` (+ Phases 2-10 Hardening)  
 > **Coverage Overview:** 237 automated tests across 16 test suites passing cleanly. Zero Clippy warnings, clean rustfmt.
 

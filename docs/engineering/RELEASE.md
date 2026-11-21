@@ -1,7 +1,7 @@
 # Release & Distribution Engineering: rewind
 
 > **Document Version:** 1.10.0  
-> **Target Software Release Version:** `0.2.0`  
+> **Target Software Release Version:** `0.3.0`  
 > **Classification:** Distribution architecture, packaging validation, release automation, and supply-chain security.
 
 ---
@@ -28,7 +28,7 @@
 
 A formal distinction is maintained between product release artifacts and internal engineering documentation:
 
-- **Product Release Version (`0.2.0`):**
+- **Product Release Version (`0.3.0`):**
   - Declared in [Cargo.toml](file:///home/tan/Projects/rewind/Cargo.toml#L3), [debian/changelog](file:///home/tan/Projects/rewind/debian/changelog#L1), [packaging/rewind.spec](file:///home/tan/Projects/rewind/packaging/rewind.spec#L5), and [docs/rewind.1](file:///home/tan/Projects/rewind/docs/rewind.1#L1).
   - Governs semantic versioning of binary releases, package dependencies, and command interface compatibility.
 - **Engineering Specification Version (`1.9.0`):**
