@@ -12,8 +12,11 @@ on:
       tag:
         description: Release tag to publish
         required: true
-        default: v0.1.1
         type: string
+
+concurrency:
+  group: apt-publish
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -25,32 +28,68 @@ jobs:
   publish:
     name: publish static .debs to the APT repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate inputs and required secrets
+        env:
+          TAG: ${{ inputs.tag }}
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_DEPLOY_KEY: ${{ secrets.APT_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAG" ]]; then
+            echo "::error::Tag input is required"
+            exit 1
+          fi
+          if [[ -z "${APT_SIGNING_KEY:-}" ]]; then
+            echo "::error::Missing required secret: APT_SIGNING_KEY"
+            exit 1
+          fi
+          if [[ -z "${APT_DEPLOY_KEY:-}" ]]; then
+            echo "::error::Missing required secret: APT_DEPLOY_KEY"
+            exit 1
+          fi
+          echo "Tag and deployment credentials validated successfully (values redacted)."
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Download release binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          rm -rf dist
           mkdir -p dist
+          echo "Downloading static musl release binaries for ${{ inputs.tag }}..."
           gh release download "${{ inputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'rewind-*-unknown-linux-musl.tar.gz' \
             --dir dist
           ls -lh dist
+          archive_count=$(find dist -name 'rewind-*-unknown-linux-musl.tar.gz' | wc -l)
+          if [[ "$archive_count" -lt 2 ]]; then
+            echo "::error::Expected at least 2 musl archives (x86_64 and aarch64), found $archive_count"
+            exit 1
+          fi
 
       - name: Extract binaries
         run: |
           set -euo pipefail
+          rm -rf pkgs
           mkdir -p pkgs
           for archive in dist/*.tar.gz; do
+            echo "Extracting $archive..."
             tar -xzf "$archive" -C pkgs
           done
           find pkgs -name rewind -type f -exec file {} \;
 
       - name: Install packaging tools
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y apt-utils dpkg-dev gnupg
 
@@ -59,11 +98,24 @@ jobs:
           set -euo pipefail
           host=$(find pkgs -path '*x86_64*' -name rewind -type f | head -1)
           arm=$(find pkgs -path '*aarch64*' -name rewind -type f | head -1)
-          [[ -n $host && -n $arm ]]
+          if [[ -z "$host" || ! -x "$host" ]]; then
+            echo "::error::x86_64 static binary not found in extracted archives"
+            exit 1
+          fi
+          if [[ -z "$arm" || ! -x "$arm" ]]; then
+            echo "::error::aarch64 static binary not found in extracted archives"
+            exit 1
+          fi
           rm -rf apt-debs
+          mkdir -p apt-debs
           REWIND_HOST_BIN="$host" ./packaging/build-static-deb.sh "$host" amd64 apt-debs
           REWIND_HOST_BIN="$host" ./packaging/build-static-deb.sh "$arm" arm64 apt-debs
           ls -lh apt-debs
+          deb_count=$(find apt-debs -name '*.deb' | wc -l)
+          if [[ "$deb_count" -lt 2 ]]; then
+            echo "::error::Expected 2 built .deb packages, found $deb_count"
+            exit 1
+          fi
 
       - name: Import signing key
         env:
@@ -71,10 +123,15 @@ jobs:
         run: |
           set -euo pipefail
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          rm -rf "$GNUPGHOME"
           mkdir -m 700 -p "$GNUPGHOME"
           printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
           fingerprint=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
-          echo "Signing with $fingerprint"
+          if [[ -z "$fingerprint" ]]; then
+            echo "::error::GPG key import succeeded but no key fingerprint found"
+            exit 1
+          fi
+          echo "Signing key imported successfully with fingerprint: $fingerprint"
           echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
 
       - name: Configure deploy key
@@ -96,6 +153,7 @@ jobs:
       - name: Publish repository
         run: |
           set -euo pipefail
+          rm -rf apt-repo
           git clone --depth 1 --branch gh-pages git@github.com:tanhank/apt.git apt-repo
           cd apt-repo
           git config user.name "rewind release bot"
@@ -104,15 +162,17 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "APT repository already up to date"
-            exit 0
+          else
+            git commit -m "apt: publish ${{ inputs.tag }}"
+            git push origin gh-pages
           fi
-          git commit -m "apt: publish ${{ inputs.tag }}"
-          git push origin gh-pages
 
       - name: Attach .debs to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          echo "Uploading Debian packages to release ${{ inputs.tag }}..."
           gh release upload "${{ inputs.tag }}" apt-debs/*.deb \
             --repo "$GITHUB_REPOSITORY" --clobber
 
@@ -122,9 +182,14 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf checksums
-          mkdir checksums
+          mkdir -p checksums
+          echo "Downloading all release assets for ${{ inputs.tag }}..."
           gh release download "${{ inputs.tag }}" \
-            --repo "$GITHUB_REPOSITORY" --pattern 'rewind*' --dir checksums
-          (cd checksums && sha256sum rewind* > SHA256SUMS)
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'rewind*' \
+            --dir checksums
+          (cd checksums && sha256sum rewind* | sort -k2 > SHA256SUMS)
+          echo "Refreshed SHA256SUMS contents:"
+          cat checksums/SHA256SUMS
           gh release upload "${{ inputs.tag }}" checksums/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --clobber
