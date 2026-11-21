@@ -256,10 +256,7 @@ pub fn restore_owners(snapshot: &OwnerSnapshot) -> Vec<String> {
     for ((uid, gid), paths) in groups {
         for chunk in paths.chunks(256) {
             let mut cmd = Command::new("chown");
-            cmd.arg("-h")
-                .arg(format!("{uid}:{gid}"))
-                .arg("--")
-                .args(chunk);
+            cmd.arg("-h").arg(format!("{uid}:{gid}")).args(chunk);
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
