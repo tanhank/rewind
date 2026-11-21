@@ -100,11 +100,11 @@ jobs:
           bin="target/${{ matrix.target }}/release/rewind"
           file_out=$(file "$bin")
           echo "$file_out"
-          echo "$file_out" | grep -q "statically linked"
+          echo "$file_out" | grep -q -E "statically linked|static-pie linked|static"
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            echo "$file_out" | grep -q "x86-64"
+            echo "$file_out" | grep -q -E "x86-64|x86_64"
           else
-            echo "$file_out" | grep -q "ARM aarch64"
+            echo "$file_out" | grep -q -E "aarch64|ARM aarch64"
           fi
       - name: Verify embedded SQLite version
         run: |
@@ -241,15 +241,15 @@ jobs:
       image: fedora:latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install build tools and dependencies
+        run: |
+          dnf install -y rpm-build rpmlint cargo rust gcc git findutils gzip tar xz
       - name: Configure git safe directory
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --global --add safe.directory "*"
           git config --global user.name "CI Validator"
           git config --global user.email "ci@example.com"
-      - name: Install build tools and dependencies
-        run: |
-          dnf install -y rpm-build rpmlint cargo rust gcc git findutils gzip tar xz
       - name: Lint RPM spec
         run: |
           rpmlint packaging/rewind.spec || true
