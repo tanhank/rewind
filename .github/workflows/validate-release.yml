@@ -250,6 +250,7 @@ jobs:
           git config --global --add safe.directory "*"
           git config --global user.name "CI Validator"
           git config --global user.email "ci@example.com"
+          echo "GIT_DISCOVERY_ACROSS_FILESYSTEM=1" >> "$GITHUB_ENV"
       - name: Lint RPM spec
         run: |
           rpmlint packaging/rewind.spec || true

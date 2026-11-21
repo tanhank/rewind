@@ -564,7 +564,8 @@ pub fn clone_file_isolated(src: &Path, dst: &Path, meta: &fs::Metadata) -> Resul
         {
             use std::os::unix::io::AsRawFd;
             const FICLONE: libc::c_ulong = 0x40049409;
-            let res = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+            let res =
+                unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
             if res == 0 {
                 copy_permissions(meta, dst)?;
                 copy_times(meta, dst);
