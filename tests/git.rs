@@ -811,6 +811,11 @@ fn git_clean_undo_handles_permission_restoration_failure_and_remains_resumable()
 
     #[cfg(unix)]
     {
+        // Root ignores directory permissions; skip permission failure assertion when running as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
         // Make the tracked parent read-only (0o555) so creating untracked_leaf fails
         sandbox.set_mode("parent", 0o555);
 
