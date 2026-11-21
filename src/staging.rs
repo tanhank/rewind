@@ -537,7 +537,7 @@ pub fn clone_file_isolated(src: &Path, dst: &Path, meta: &fs::Metadata) -> Resul
             CString::new(src.as_os_str().as_bytes()),
             CString::new(dst.as_os_str().as_bytes()),
         ) {
-            extern "C" {
+            unsafe extern "C" {
                 fn clonefile(
                     src: *const libc::c_char,
                     dst: *const libc::c_char,
