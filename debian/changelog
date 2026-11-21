@@ -1,3 +1,18 @@
+rewind (0.3.0-1) resolute; urgency=medium
+
+  * Production release v0.3.0.
+  * Filesystem security, traversal guards, and containment validation.
+  * Multi-process concurrency control with per-repository lockfile and stale PID recovery.
+  * Sensitive secret redaction across journal entries and staging directory paths.
+  * Independent snapshot isolation and atomic capacity reservations.
+  * Expanded Git recovery: rebase, stash reconstruction, reflog, and linked worktrees.
+  * Zero-allocation coreutils argument parser consolidation and performance profiling.
+  * Unix-native CLI enhancements: JSON output schema, shell completions, and manpages.
+  * Multi-platform packaging: Debian (.deb), Fedora (.rpm), static musl, and macOS.
+  * Rust MSRV requirement updated to 1.89 with SQLite 3.54.1.
+
+ -- Hank Tan <tanhank@users.noreply.github.com>  Sat, 21 Nov 2026 05:25:00 -0600
+
 rewind (0.2.0-1) resolute; urgency=medium
 
   * Add `rewind inspect <ID>` command with terminal and JSON output.

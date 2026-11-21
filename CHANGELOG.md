@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
+Major production release featuring deep reliability hardening, cross-platform distribution pipelines, strict security boundaries, and enhanced Git recovery.
+
+### Added
+
+- **Filesystem security & path containment**: Enforced canonical traversal checks preventing staging outside repository boundaries or across untrusted symlink loops.
+- **Process synchronization**: File-descriptor backed per-repository lockfile (`.lock`) preventing concurrent data corruption, with automatic stale PID detection and process liveness recovery.
+- **Sensitive data redaction**: Automatic redaction of credentials, API tokens, authorization headers, and sensitive filenames in SQLite journal entries and staging directory trees.
+- **Independent snapshot isolation**: Copy-on-write `FICLONE` / `clonefile` snapshot staging with fallback to hardlinks and atomic copy reservations, isolating backups from concurrent mutations.
+- **Storage capacity management**: Configurable storage quotas, atomic quota pre-allocation checks, and LRU garbage collection.
+- **Expanded Git recovery**: Full undo support for `git reset --hard`, `git clean -fd`, `git commit --amend`, `git rebase` (abort/continue), and stash reconstruction (`stash drop`, `stash pop`, `stash clear`).
+- **Linked worktree support**: Safe ref pinning and staging isolation across linked Git worktrees without shared repository state corruption.
+- **Consolidated coreutils argument parser**: Shared zero-allocation argument parsing across `rm`, `cp`, `mv`, `chmod`, `chown`, and `git` commands with full POSIX compatibility.
+- **Performance engineering**: Zero-copy staging paths, optimized SQLite statement caching, and Criterion benchmark suite (`benches/workloads.rs`).
+- **Unix-native CLI & completions**: Machine-readable `--json` schema across all commands, manual page (`rewind.1`), and native shell completions for Bash, Zsh, and Fish.
+- **Cross-platform distribution**: Debian package (`.deb`), Fedora RPM (`.rpm`), static `musl` binaries for `x86_64` and `aarch64`, and native macOS builds for Apple Silicon (`macos-15`) and Intel (`macos-15-intel`).
+
+### Changed
+
+- **MSRV updated**: Minimum Supported Rust Version increased to **1.89.0** (Rust Edition 2024).
+- **SQLite upgraded**: Embedded SQLite engine upgraded to **3.54.1** via patched `libsqlite3-sys`.
+
+### Known Limitations
+
+- Binary execution testing for `aarch64-unknown-linux-musl` is limited to static analysis and compilation verification on x86_64 CI runners without native ARM64 virtual execution hardware.
+
 ## [0.2.0] - 2026-10-27
 
 ### Added
@@ -96,7 +123,8 @@ First public release.
 - **Packaging**: RPM spec for Fedora/COPR and Debian packaging for
   Debian/Ubuntu, including shell completion and hook installation.
 
-[Unreleased]: https://github.com/tanhank/rewind/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/tanhank/rewind/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/tanhank/rewind/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tanhank/rewind/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/tanhank/rewind/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tanhank/rewind/releases/tag/v0.1.0

@@ -215,7 +215,7 @@ Recovery:
 
 ```console
 $ rewind status
-rewind 0.2.0
+rewind 0.3.0
 
   data      /home/you/.local/share/rewind
   config    /home/you/.config/rewind/config.toml

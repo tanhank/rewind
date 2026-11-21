@@ -17,7 +17,7 @@ fn metadata_consistency_across_cargo_debian_rpm_man() {
         .find(|l| l.starts_with("version = "))
         .expect("version line");
     let cargo_version = version_line.split('"').nth(1).expect("cargo version value");
-    assert_eq!(cargo_version, "0.2.0");
+    assert_eq!(cargo_version, "0.3.0");
     assert!(cargo_toml.contains("license = \"MIT\""));
     assert!(cargo_toml.contains("rust-version = \"1.89\""));
 
@@ -25,19 +25,19 @@ fn metadata_consistency_across_cargo_debian_rpm_man() {
     let debian_changelog =
         fs::read_to_string(root.join("debian/changelog")).expect("debian/changelog");
     assert!(
-        debian_changelog.starts_with("rewind (0.2.0-1)"),
+        debian_changelog.starts_with("rewind (0.3.0-1)"),
         "debian/changelog first line mismatch"
     );
 
     // 3. packaging/rewind.spec
     let rpm_spec = fs::read_to_string(root.join("packaging/rewind.spec")).expect("rewind.spec");
-    assert!(rpm_spec.contains("Version:        0.2.0"));
+    assert!(rpm_spec.contains("Version:        0.3.0"));
     assert!(rpm_spec.contains("License:        MIT"));
     assert!(rpm_spec.contains("Release:        1%{?dist}"));
 
     // 4. docs/rewind.1
     let man_page = fs::read_to_string(root.join("docs/rewind.1")).expect("docs/rewind.1");
-    assert!(man_page.contains("\"rewind 0.2.0\""));
+    assert!(man_page.contains("\"rewind 0.3.0\""));
     assert!(man_page.contains(".TH REWIND 1"));
 
     // 5. Package manifests describe all wrapped git commands
@@ -298,7 +298,7 @@ fn static_deb_package_builder_layout() {
         .expect("execute build-static-deb.sh");
     assert!(status.success(), "build-static-deb.sh failed");
 
-    let deb_file = outdir.join("rewind_0.2.0-1_amd64.deb");
+    let deb_file = outdir.join("rewind_0.3.0-1_amd64.deb");
     assert!(deb_file.exists(), "deb package was not created");
 
     // Verify ar archive contents
@@ -321,7 +321,7 @@ fn release_tarball_and_checksum_verification() {
     let dist_dir = sandbox.work.join("dist");
     fs::create_dir_all(&dist_dir).unwrap();
 
-    let archive_name = "rewind-0.2.0-x86_64-unknown-linux-musl.tar.gz";
+    let archive_name = "rewind-0.3.0-x86_64-unknown-linux-musl.tar.gz";
     let archive_path = dist_dir.join(archive_name);
 
     // Create a mock release tarball

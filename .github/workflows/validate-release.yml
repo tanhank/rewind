@@ -124,11 +124,11 @@ jobs:
           set -euo pipefail
           bin="./target/${{ matrix.target }}/release/rewind"
           echo "Testing version..."
-          $bin --version | grep "0.2.0"
+          $bin --version | grep "0.3.0"
           echo "Testing help..."
           $bin --help > /dev/null
           echo "Testing status --json..."
-          $bin status --json | grep '"version": "0.2.0"'
+          $bin status --json | grep '"version": "0.3.0"'
           echo "Testing completions..."
           $bin completions bash > /dev/null
           $bin completions zsh > /dev/null
@@ -208,9 +208,9 @@ jobs:
       - name: Validate installed CLI commands
         run: |
           set -euo pipefail
-          /usr/bin/rewind --version | grep "0.2.0"
+          /usr/bin/rewind --version | grep "0.3.0"
           /usr/bin/rewind --help > /dev/null
-          /usr/bin/rewind status --json | grep '"version": "0.2.0"'
+          /usr/bin/rewind status --json | grep '"version": "0.3.0"'
       - name: Validate staging and undo via installed binary
         run: |
           set -euo pipefail
@@ -284,9 +284,9 @@ jobs:
       - name: Validate installed CLI commands
         run: |
           set -euo pipefail
-          /usr/bin/rewind --version | grep "0.2.0"
+          /usr/bin/rewind --version | grep "0.3.0"
           /usr/bin/rewind --help > /dev/null
-          /usr/bin/rewind status --json | grep '"version": "0.2.0"'
+          /usr/bin/rewind status --json | grep '"version": "0.3.0"'
       - name: Validate staging and undo via installed binary
         run: |
           set -euo pipefail

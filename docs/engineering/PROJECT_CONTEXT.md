@@ -1,7 +1,7 @@
 # Project Context & Agent Operating Guide: rewind
 
 > **Document Version:** 1.11.0  
-> **Software Product Release Version:** `0.2.0`  
+> **Software Product Release Version:** `0.3.0`  
 > **Repository Commit SHA:** `08a325fc468709928f8e7f5401b418a69d253d66` (+ Phases 2-11 Hardening & Release Validation)  
 > **Discovery Date:** 2026-11-21  
 > **Scope Assessed:** Complete repository inventory (src, shell, tests, packaging, CI/CD, docs)  
@@ -9,7 +9,7 @@
 
 > [!NOTE]
 > **Version Taxonomy Distinction:**
-> - **Product Release Version (`0.2.0`):** Semantic release version declared in `Cargo.toml`, `debian/changelog`, `packaging/rewind.spec`, and `docs/rewind.1`. Governs binary artifacts and distribution packages.
+> - **Product Release Version (`0.3.0`):** Semantic release version declared in `Cargo.toml`, `debian/changelog`, `packaging/rewind.spec`, and `docs/rewind.1`. Governs binary artifacts and distribution packages.
 > - **Engineering Knowledge Base Specification Version (`1.11.0`):** Internal document version tracking incremental development, security audits, and lifecycle phases (Phases 1-11).
 
 ---

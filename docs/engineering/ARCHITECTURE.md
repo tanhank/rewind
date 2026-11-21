@@ -1,7 +1,7 @@
 # System Architecture: rewind
 
 > **Document Version:** 1.10.0  
-> **Target Software Release Version:** `0.2.0`  
+> **Target Software Release Version:** `0.3.0`  
 > **Commit SHA:** `08a325fc468709928f8e7f5401b418a69d253d66` (+ Phases 2-10 Hardening)  
 > **System Classification:** Single-binary shell interceptor, durable SQLite journal, user-space state manager.
 
