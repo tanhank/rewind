@@ -17,6 +17,7 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::journal::{EntryStatus, Journal, NewStaged, StagedKind};
 use crate::paths::Paths;
@@ -54,7 +55,12 @@ enum Parsed {
     Passthrough,
 }
 
-pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<i32> {
+pub fn execute(
+    journal: &mut Journal,
+    paths: &Paths,
+    config: &Config,
+    argv: &[String],
+) -> Result<i32> {
     let options = match parse(argv) {
         Parsed::Passthrough => return run_passthrough("rm", argv),
         Parsed::Run(options) => options,
@@ -72,12 +78,32 @@ pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<
         return run_passthrough("rm", argv);
     }
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(10))?;
     let cwd = env::current_dir().map_err(|err| Error::Io {
         context: "reading current directory".into(),
         source: err,
     })?;
     let entry_id = journal.begin_entry("rm", argv, &cwd)?;
     let stager = Stager::new(paths, entry_id);
+
+    let mut estimated_incoming = 0u64;
+    for raw in &options.paths {
+        if let Ok(abs) = absolutize(Path::new(raw)) {
+            if !config.trash.is_excluded(&abs) {
+                estimated_incoming =
+                    estimated_incoming.saturating_add(crate::staging::tree_size(&abs).unwrap_or(0));
+            }
+        }
+    }
+    if let Err(err) = journal.reserve_capacity(
+        entry_id,
+        estimated_incoming,
+        config.trash.max_bytes,
+        config.trash.retention_days,
+    ) {
+        journal.delete_entry(entry_id)?;
+        return Err(err);
+    }
 
     if options.interactive == Interactive::Once
         && (options.paths.len() > 3 || options.recursive)
@@ -105,7 +131,7 @@ pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<
             }
         };
 
-        match process_operand(&options, raw, &absolute, &stager, journal, entry_id) {
+        match process_operand(&options, raw, &absolute, &stager, journal, entry_id, config) {
             Ok(OperandResult::Staged) => staged_count += 1,
             Ok(OperandResult::DeletedDirectly) => {
                 unsaved_count += 1;
@@ -169,6 +195,7 @@ fn process_operand(
     stager: &Stager<'_>,
     journal: &mut Journal,
     entry_id: i64,
+    config: &Config,
 ) -> std::result::Result<OperandResult, OperandError> {
     let meta = match fs::symlink_metadata(absolute) {
         Ok(meta) => meta,
@@ -194,6 +221,21 @@ fn process_operand(
              rm: use --no-preserve-root to override this failsafe"
                 .into(),
         ));
+    }
+
+    if config.trash.is_excluded(absolute) {
+        match remove_tree(absolute) {
+            Ok(()) => {
+                if options.verbose {
+                    println!("removed '{raw}'");
+                }
+                eprintln!(
+                    "rewind: '{raw}' matches trash.exclude_patterns; permanently deleted without undo snapshot"
+                );
+                return Ok(OperandResult::DeletedDirectly);
+            }
+            Err(err) => return Err(OperandError::Message(err.to_string())),
+        }
     }
 
     if is_dir && !options.recursive {
@@ -319,28 +361,14 @@ fn parse(argv: &[String]) -> Parsed {
         no_preserve_root: false,
         paths: Vec::new(),
     };
-    let mut only_paths = false;
 
-    for arg in argv {
-        if only_paths {
-            options.paths.push(arg.clone());
-            continue;
-        }
-        if arg == "--" {
-            only_paths = true;
-            continue;
-        }
-        if arg == "-" || !arg.starts_with('-') {
-            options.paths.push(arg.clone());
-            continue;
-        }
-
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, value) = match long.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (long, None),
-            };
-            match name {
+    let mut scanner = super::args::ArgScanner::new(argv);
+    while let Some(token) = scanner.next_token() {
+        match token {
+            super::args::ArgToken::Operand(path) => {
+                options.paths.push(path.to_string());
+            }
+            super::args::ArgToken::Long { name, inline_value } => match name {
                 "force" => {
                     options.force = true;
                     options.interactive = Interactive::Never;
@@ -349,7 +377,7 @@ fn parse(argv: &[String]) -> Parsed {
                 "dir" => options.dir = true,
                 "verbose" => options.verbose = true,
                 "interactive" => {
-                    options.interactive = match value.unwrap_or("always") {
+                    options.interactive = match inline_value.unwrap_or("always") {
                         "never" | "no" | "none" => Interactive::Never,
                         "once" => Interactive::Once,
                         "always" | "yes" => Interactive::Always,
@@ -364,29 +392,28 @@ fn parse(argv: &[String]) -> Parsed {
                 "preserve-root" => options.no_preserve_root = false,
                 "help" | "version" => return Parsed::Passthrough,
                 _ => return Parsed::Passthrough,
-            }
-            continue;
-        }
-
-        // Short option cluster, e.g. -rf or -rfv.
-        for flag in arg.chars().skip(1) {
-            match flag {
-                'f' => {
-                    options.force = true;
-                    options.interactive = Interactive::Never;
+            },
+            super::args::ArgToken::Short(mut cluster) => {
+                while let Some(flag) = cluster.next_flag() {
+                    match flag {
+                        'f' => {
+                            options.force = true;
+                            options.interactive = Interactive::Never;
+                        }
+                        'r' | 'R' => options.recursive = true,
+                        'd' => options.dir = true,
+                        'v' => options.verbose = true,
+                        'i' => {
+                            options.interactive = Interactive::Always;
+                            options.force = false;
+                        }
+                        'I' => {
+                            options.interactive = Interactive::Once;
+                            options.force = false;
+                        }
+                        _ => return Parsed::Passthrough,
+                    }
                 }
-                'r' | 'R' => options.recursive = true,
-                'd' => options.dir = true,
-                'v' => options.verbose = true,
-                'i' => {
-                    options.interactive = Interactive::Always;
-                    options.force = false;
-                }
-                'I' => {
-                    options.interactive = Interactive::Once;
-                    options.force = false;
-                }
-                _ => return Parsed::Passthrough,
             }
         }
     }

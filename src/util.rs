@@ -54,6 +54,42 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Query the start time of a process (used for reliable PID liveness and reuse detection).
+#[cfg(target_os = "linux")]
+pub fn get_process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rparen = stat.rfind(')')?;
+    let rest = stat.get(rparen + 1..)?.trim();
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(19)?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_process_start_time(pid: u32) -> Option<u64> {
+    use std::mem;
+    unsafe {
+        let mut proc_info: libc::proc_bsdinfo = mem::zeroed();
+        let size = mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let ret = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut proc_info as *mut _ as *mut libc::c_void,
+            size,
+        );
+        if ret == size {
+            Some(proc_info.pbi_start_tvsec)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn get_process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// Parse a retention duration such as `30d`, `12h`, `90m`, `2w`.
 pub fn parse_duration(input: &str) -> Result<u64> {
     let trimmed = input.trim();

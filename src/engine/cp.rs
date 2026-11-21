@@ -9,6 +9,7 @@ use std::env;
 
 use serde_json::json;
 
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::journal::{EntryStatus, Journal, NewStaged, StagedKind};
 use crate::paths::Paths;
@@ -25,7 +26,12 @@ struct DestPlan {
     created_row: Option<i64>,
 }
 
-pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<i32> {
+pub fn execute(
+    journal: &mut Journal,
+    paths: &Paths,
+    config: &Config,
+    argv: &[String],
+) -> Result<i32> {
     let Parsed::Run(parsed) = transfer::parse(argv, "cp") else {
         return run_passthrough("cp", argv);
     };
@@ -34,12 +40,34 @@ pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<
         _ => return run_passthrough("cp", argv),
     };
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
     let cwd = env::current_dir().map_err(|err| Error::Io {
         context: "reading current directory".into(),
         source: err,
     })?;
     let entry_id = journal.begin_entry("cp", argv, &cwd)?;
     let stager = Stager::new(paths, entry_id);
+
+    let mut estimated_incoming = 0u64;
+    for pair in &pairs {
+        if pair.dest.symlink_metadata().is_ok()
+            && pair.src.symlink_metadata().is_ok()
+            && !parsed.no_clobber
+            && !config.trash.is_excluded(&pair.dest)
+        {
+            estimated_incoming = estimated_incoming
+                .saturating_add(crate::staging::tree_size(&pair.dest).unwrap_or(0));
+        }
+    }
+    if let Err(err) = journal.reserve_capacity(
+        entry_id,
+        estimated_incoming,
+        config.trash.max_bytes,
+        config.trash.retention_days,
+    ) {
+        journal.delete_entry(entry_id)?;
+        return Err(err);
+    }
 
     let mut dests: Vec<DestPlan> = Vec::new();
     let mut snapshot_failures = 0usize;
@@ -52,7 +80,7 @@ pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<
         // With --no-clobber an existing destination is left untouched, so
         // there is nothing to protect. A missing source means cp will never
         // reach the destination at all.
-        if existed && src_exists && !parsed.no_clobber {
+        if existed && src_exists && !parsed.no_clobber && !config.trash.is_excluded(&pair.dest) {
             match stager.snapshot(&pair.dest, SnapshotMode::Copy) {
                 Ok(payload) => {
                     let item = NewStaged::new(

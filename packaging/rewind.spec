@@ -17,7 +17,8 @@ BuildRequires:  rust
 %description
 rewind sits between your shell and commands that destroy state. It stages the
 pre-action state of rm, mv, cp, chmod, chown, git reset --hard, git clean,
-git checkout, git restore, and git branch -D, runs the real command with unchanged output and
+git checkout, git restore, git branch -D, git commit --amend, git rebase,
+and git stash drop/clear/pop, runs the real command with unchanged output and
 exit code, and keeps a local journal so the action can be reversed later.
 
 Undo is resumable and works across commands: one "rewind undo" reverses the

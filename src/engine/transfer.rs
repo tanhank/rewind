@@ -42,107 +42,79 @@ pub enum Parsed {
 pub fn parse(argv: &[String], command: &str) -> Parsed {
     let mut transfer = Transfer::default();
     let mut operands: Vec<String> = Vec::new();
-    let mut only_operands = false;
-    let mut iter = argv.iter();
+    let mut scanner = super::args::ArgScanner::new(argv);
 
-    while let Some(arg) = iter.next() {
-        if only_operands {
-            operands.push(arg.clone());
-            continue;
-        }
-        if arg == "--" {
-            only_operands = true;
-            continue;
-        }
-        if arg == "-" || !arg.starts_with('-') {
-            operands.push(arg.clone());
-            continue;
-        }
-
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, inline) = match long.split_once('=') {
-                Some((name, value)) => (name, Some(value.to_string())),
-                None => (long, None),
-            };
-            match name {
-                "target-directory" => {
-                    let value = match inline {
-                        Some(value) => value,
-                        None => match iter.next() {
-                            Some(value) => value.clone(),
-                            None => return Parsed::Passthrough,
-                        },
-                    };
-                    transfer.target_dir = Some(value);
-                }
-                "no-target-directory" => transfer.no_target_dir = true,
-                "no-clobber" => transfer.no_clobber = true,
-                "recursive" => transfer.recursive = true,
-                "verbose"
-                | "force"
-                | "interactive"
-                | "update"
-                | "link"
-                | "symbolic-link"
-                | "one-file-system"
-                | "strip-trailing-slashes"
-                | "remove-destination"
-                | "attributes-only"
-                | "archive"
-                | "no-dereference"
-                | "dereference"
-                | "parents"
-                | "reflink"
-                | "sparse"
-                | "preserve"
-                | "no-preserve"
-                | "context" => {}
-                "suffix" => {
-                    if inline.is_none() && iter.next().is_none() {
-                        return Parsed::Passthrough;
-                    }
-                }
-                // Backups, exchange mode, and anything unrecognized are
-                // delegated: they create extra paths we do not model.
-                _ => return Parsed::Passthrough,
+    while let Some(token) = scanner.next_token() {
+        match token {
+            super::args::ArgToken::Operand(op) => {
+                operands.push(op.to_string());
             }
-            continue;
-        }
-
-        // Short option cluster.
-        let mut chars = arg.chars().skip(1).peekable();
-        while let Some(flag) = chars.next() {
-            match flag {
-                't' => {
-                    let rest: String = chars.by_ref().collect();
-                    let value = if rest.is_empty() {
-                        match iter.next() {
-                            Some(value) => value.clone(),
+            super::args::ArgToken::Long { name, inline_value } => {
+                match name {
+                    "target-directory" => {
+                        let value = match inline_value.or_else(|| scanner.next_raw_arg()) {
+                            Some(val) => val.to_string(),
                             None => return Parsed::Passthrough,
+                        };
+                        transfer.target_dir = Some(value);
+                    }
+                    "no-target-directory" => transfer.no_target_dir = true,
+                    "no-clobber" => transfer.no_clobber = true,
+                    "recursive" => transfer.recursive = true,
+                    "verbose"
+                    | "force"
+                    | "interactive"
+                    | "update"
+                    | "link"
+                    | "symbolic-link"
+                    | "one-file-system"
+                    | "strip-trailing-slashes"
+                    | "remove-destination"
+                    | "attributes-only"
+                    | "archive"
+                    | "no-dereference"
+                    | "dereference"
+                    | "parents"
+                    | "reflink"
+                    | "sparse"
+                    | "preserve"
+                    | "no-preserve"
+                    | "context" => {}
+                    "suffix" => {
+                        if inline_value.is_none() && scanner.next_raw_arg().is_none() {
+                            return Parsed::Passthrough;
                         }
-                    } else {
-                        rest
-                    };
-                    transfer.target_dir = Some(value);
+                    }
+                    // Backups, exchange mode, and anything unrecognized are
+                    // delegated: they create extra paths we do not model.
+                    _ => return Parsed::Passthrough,
                 }
-                'S' => {
-                    let rest: String = chars.by_ref().collect();
-                    let consumed = if rest.is_empty() {
-                        iter.next().is_some()
-                    } else {
-                        true
-                    };
-                    if !consumed {
-                        return Parsed::Passthrough;
+            }
+            super::args::ArgToken::Short(mut cluster) => {
+                while let Some(flag) = cluster.next_flag() {
+                    match flag {
+                        't' => {
+                            let value = match cluster.take_value(&mut scanner) {
+                                Some(val) => val.to_string(),
+                                None => return Parsed::Passthrough,
+                            };
+                            transfer.target_dir = Some(value);
+                        }
+                        'S' => {
+                            if cluster.take_value(&mut scanner).is_none() {
+                                return Parsed::Passthrough;
+                            }
+                        }
+                        'T' => transfer.no_target_dir = true,
+                        'n' => transfer.no_clobber = true,
+                        'r' | 'R' | 'a' => transfer.recursive = true,
+                        'v' | 'f' | 'i' | 'p' | 'd' | 'u' | 'l' | 's' | 'x' | 'L' | 'P' | 'H'
+                        | 'Z' => {}
+                        // -b/--backup creates side files; leave it to the real command.
+                        'b' => return Parsed::Passthrough,
+                        _ => return Parsed::Passthrough,
                     }
                 }
-                'T' => transfer.no_target_dir = true,
-                'n' => transfer.no_clobber = true,
-                'r' | 'R' | 'a' => transfer.recursive = true,
-                'v' | 'f' | 'i' | 'p' | 'd' | 'u' | 'l' | 's' | 'x' | 'L' | 'P' | 'H' | 'Z' => {}
-                // -b/--backup creates side files; leave it to the real command.
-                'b' => return Parsed::Passthrough,
-                _ => return Parsed::Passthrough,
             }
         }
     }

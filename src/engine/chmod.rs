@@ -28,10 +28,12 @@ pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<
         Err(_) => return run_passthrough("chmod", argv),
     };
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
     let cwd = env::current_dir().map_err(|err| Error::Io {
         context: "reading current directory".into(),
         source: err,
     })?;
+
     let entry_id = journal.begin_entry("chmod", argv, &cwd)?;
     let stager = Stager::new(paths, entry_id);
 

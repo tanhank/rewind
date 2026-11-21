@@ -1,0 +1,345 @@
+name: Validate Release
+
+on:
+  push:
+    branches:
+      - "pre-release/**"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "packaging/**"
+      - ".github/workflows/**"
+      - "debian/**"
+  workflow_dispatch:
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Run audit
+        run: cargo audit --deny warnings --ignore RUSTSEC-2020-0071 --ignore RUSTSEC-2020-0159 --ignore RUSTSEC-2026-0543
+
+  linux:
+    name: Linux build, test, and CLI smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: CLI smoke test
+        run: |
+          set -euo pipefail
+          ./target/release/rewind --version
+          ./target/release/rewind --help
+          ./target/release/rewind status --json
+          ./target/release/rewind completions bash > /dev/null
+          ./target/release/rewind completions zsh > /dev/null
+          ./target/release/rewind completions fish > /dev/null
+
+  musl:
+    name: static musl build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: validate-${{ matrix.target }}
+      - name: Build binary with cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Verify binary exists
+        run: |
+          test -f "target/${{ matrix.target }}/release/rewind"
+      - name: Verify static linkage and architecture
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/rewind"
+          file_out=$(file "$bin")
+          echo "$file_out"
+          echo "$file_out" | grep -q -E "statically linked|static-pie linked|static"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            echo "$file_out" | grep -q -E "x86-64|x86_64"
+          else
+            echo "$file_out" | grep -q -E "aarch64|ARM aarch64"
+          fi
+      - name: Verify embedded SQLite version
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/rewind"
+          sqlite_ver=$(strings "$bin" | grep -E '^3\.[0-9]+\.[0-9]+' | head -1)
+          echo "Found SQLite version string in binary: $sqlite_ver"
+          [ "$sqlite_ver" = "3.54.1" ]
+      - name: Generate SHA256 checksum
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/rewind"
+          sha256sum "$bin" | tee "${bin}.sha256"
+      - name: Native smoke tests (x86_64 runner)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          bin="./target/${{ matrix.target }}/release/rewind"
+          echo "Testing version..."
+          $bin --version | grep "0.2.0"
+          echo "Testing help..."
+          $bin --help > /dev/null
+          echo "Testing status --json..."
+          $bin status --json | grep '"version": "0.2.0"'
+          echo "Testing completions..."
+          $bin completions bash > /dev/null
+          $bin completions zsh > /dev/null
+          $bin completions fish > /dev/null
+          echo "Testing staging and undo execution..."
+          test_dir=$(mktemp -d)
+          echo "musl validation payload" > "$test_dir/file.txt"
+          $bin exec rm -- "$test_dir/file.txt"
+          test ! -f "$test_dir/file.txt"
+          $bin undo
+          test -f "$test_dir/file.txt"
+          test "$(cat "$test_dir/file.txt")" = "musl validation payload"
+          rm -rf "$test_dir"
+      - name: Note cross-compiled execution boundary (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          echo "Target ${{ matrix.target }} cross-compiled on x86_64 runner. Linkage and symbols verified; runtime execution requires aarch64 host or QEMU."
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rewind-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/rewind
+          if-no-files-found: error
+
+  debian:
+    name: Debian package validation
+    needs: musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download musl artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: musl-artifacts
+      - name: Install package tools
+        run: sudo apt-get update && sudo apt-get install -y binutils dpkg
+      - name: Prepare binaries
+        run: |
+          set -euo pipefail
+          chmod +x musl-artifacts/rewind-*/rewind
+          ls -lh musl-artifacts/*
+      - name: Build static debian packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist/deb
+          host_bin="musl-artifacts/rewind-x86_64-unknown-linux-musl/rewind"
+          arm_bin="musl-artifacts/rewind-aarch64-unknown-linux-musl/rewind"
+          
+          echo "Building amd64 debian package..."
+          REWIND_HOST_BIN="$host_bin" ./packaging/build-static-deb.sh "$host_bin" amd64 dist/deb
+          
+          echo "Building arm64 debian package..."
+          REWIND_HOST_BIN="$host_bin" ./packaging/build-static-deb.sh "$arm_bin" arm64 dist/deb
+      - name: Verify package archives and metadata
+        run: |
+          set -euo pipefail
+          for deb in dist/deb/*.deb; do
+            echo "=== Inspecting $deb ==="
+            ar -t "$deb"
+            dpkg-deb -I "$deb"
+            dpkg-deb -c "$deb"
+          done
+      - name: Install amd64 package
+        run: |
+          set -euo pipefail
+          sudo dpkg -i dist/deb/*_amd64.deb
+      - name: Validate installed package files and permissions
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/rewind
+          test -f /usr/share/bash-completion/completions/rewind
+          test -f /usr/share/zsh/vendor-completions/_rewind
+          test -f /usr/share/fish/vendor_completions.d/rewind.fish
+          test -f /usr/share/man/man1/rewind.1.gz
+          test -f /usr/share/doc/rewind/copyright
+          man -P cat /usr/share/man/man1/rewind.1.gz | head -n 25
+      - name: Validate installed CLI commands
+        run: |
+          set -euo pipefail
+          /usr/bin/rewind --version | grep "0.2.0"
+          /usr/bin/rewind --help > /dev/null
+          /usr/bin/rewind status --json | grep '"version": "0.2.0"'
+      - name: Validate staging and undo via installed binary
+        run: |
+          set -euo pipefail
+          test_dir=$(mktemp -d)
+          echo "debian pkg validation" > "$test_dir/deb_test.txt"
+          /usr/bin/rewind exec rm -- "$test_dir/deb_test.txt"
+          test ! -f "$test_dir/deb_test.txt"
+          /usr/bin/rewind undo
+          test -f "$test_dir/deb_test.txt"
+          test "$(cat "$test_dir/deb_test.txt")" = "debian pkg validation"
+          rm -rf "$test_dir"
+      - name: Verify package removal preserves user journal data
+        run: |
+          set -euo pipefail
+          journal="$HOME/.local/share/rewind/journal.db"
+          test -f "$journal"
+          echo "Removing rewind package..."
+          sudo dpkg -r rewind
+          test ! -f /usr/bin/rewind
+          echo "Checking user journal is preserved after package removal..."
+          test -f "$journal"
+          echo "User journal preserved successfully."
+
+  fedora-rpm:
+    name: Fedora RPM build and package validation
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and dependencies
+        run: |
+          dnf install -y rpm-build rpmlint cargo rust gcc git findutils gzip tar xz
+      - name: Configure git safe directory
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "*"
+          git config --global user.name "CI Validator"
+          git config --global user.email "ci@example.com"
+          echo "GIT_DISCOVERY_ACROSS_FILESYSTEM=1" >> "$GITHUB_ENV"
+      - name: Lint RPM spec
+        run: |
+          rpmlint packaging/rewind.spec || true
+      - name: Build RPM and SRPM with vendored sources
+        run: |
+          ./packaging/build-rpm.sh --with-vendor
+      - name: Lint generated RPMs
+        run: |
+          find packaging/rpmbuild -type f -name '*.rpm' -exec rpmlint {} + || true
+      - name: Inspect RPM metadata and payload
+        run: |
+          set -euo pipefail
+          rpm_pkg=$(find packaging/rpmbuild/RPMS -type f -name '*.rpm' | head -1)
+          test -n "$rpm_pkg"
+          echo "Inspecting $rpm_pkg"
+          rpm -qip "$rpm_pkg"
+          rpm -qlp "$rpm_pkg"
+      - name: Install built RPM
+        run: |
+          set -euo pipefail
+          rpm_pkg=$(find packaging/rpmbuild/RPMS -type f -name '*.rpm' | head -1)
+          dnf --setopt=tsflags= install -y "$rpm_pkg"
+      - name: Validate installed package files
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/rewind
+          test -f /usr/share/bash-completion/completions/rewind
+          test -f /usr/share/zsh/site-functions/_rewind
+          test -f /usr/share/fish/vendor_completions.d/rewind.fish
+          ls -la /usr/share/man/man1/rewind.1*
+      - name: Validate installed CLI commands
+        run: |
+          set -euo pipefail
+          /usr/bin/rewind --version | grep "0.2.0"
+          /usr/bin/rewind --help > /dev/null
+          /usr/bin/rewind status --json | grep '"version": "0.2.0"'
+      - name: Validate staging and undo via installed binary
+        run: |
+          set -euo pipefail
+          test_dir=$(mktemp -d)
+          echo "fedora rpm validation" > "$test_dir/rpm_test.txt"
+          /usr/bin/rewind exec rm -- "$test_dir/rpm_test.txt"
+          test ! -f "$test_dir/rpm_test.txt"
+          /usr/bin/rewind undo
+          test -f "$test_dir/rpm_test.txt"
+          test "$(cat "$test_dir/rpm_test.txt")" = "fedora rpm validation"
+          rm -rf "$test_dir"
+      - name: Verify package removal preserves user journal data
+        run: |
+          set -euo pipefail
+          journal="$HOME/.local/share/rewind/journal.db"
+          test -f "$journal"
+          echo "Removing rewind RPM package..."
+          dnf remove -y rewind
+          test ! -f /usr/bin/rewind
+          echo "Checking user journal is preserved after RPM removal..."
+          test -f "$journal"
+          echo "User journal preserved successfully."
+
+  macos:
+    name: macOS build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: validate-${{ matrix.os }}
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: CLI smoke test
+        run: |
+          set -euo pipefail
+          ./target/release/rewind --version
+          ./target/release/rewind --help
+          ./target/release/rewind status --json

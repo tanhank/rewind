@@ -13,8 +13,8 @@ use crate::staging::{remove_tree, tree_size};
 use crate::util::{ellipsize, format_timestamp, human_size, now_unix, parse_duration, time_ago};
 
 /// Show journal history.
-pub fn log(journal: &Journal, limit: usize, as_json: bool) -> Result<()> {
-    let entries = journal.list(limit, true)?;
+pub fn log(journal: &Journal, filter: &crate::journal::LogFilter, as_json: bool) -> Result<()> {
+    let entries = journal.list_filtered(filter)?;
     if as_json {
         let mut rows = Vec::new();
         for entry in &entries {
@@ -58,7 +58,10 @@ pub fn log(journal: &Journal, limit: usize, as_json: bool) -> Result<()> {
         };
         let size_text = if size > 0 {
             human_size(size)
-        } else if entry.command == "git_reset" {
+        } else if matches!(
+            entry.command.as_str(),
+            "git_reset" | "git_commit_amend" | "git_rebase" | "git_stash" | "git_branch_delete"
+        ) {
             "snapshot".to_string()
         } else {
             "-".to_string()
@@ -292,7 +295,10 @@ fn analyze(entry: &Entry, items: &[StagedView]) -> RecoveryView {
     let mut conflicts = Vec::new();
     let mut missing = Vec::new();
 
-    if entry.command == "git_reset" {
+    if matches!(
+        entry.command.as_str(),
+        "git_reset" | "git_commit_amend" | "git_rebase"
+    ) {
         match entry.meta.get("repo").and_then(Value::as_str) {
             Some(repo) if Path::new(repo).is_dir() => {}
             Some(repo) => missing.push(format!("repository {repo} no longer exists")),
@@ -300,6 +306,12 @@ fn analyze(entry: &Entry, items: &[StagedView]) -> RecoveryView {
         }
         if entry.meta.get("head").and_then(Value::as_str).is_none() {
             missing.push("entry has no HEAD snapshot".into());
+        }
+    } else if entry.command == "git_stash" {
+        match entry.meta.get("repo").and_then(Value::as_str) {
+            Some(repo) if Path::new(repo).is_dir() => {}
+            Some(repo) => missing.push(format!("repository {repo} no longer exists")),
+            None => missing.push("entry has no repository path".into()),
         }
     } else if entry.command == "git_branch_delete" {
         let (branch_conflicts, branch_missing) = crate::engine::git::branch_delete_blockers(entry);
@@ -344,7 +356,7 @@ fn analyze(entry: &Entry, items: &[StagedView]) -> RecoveryView {
 
     let snapshot_backed = matches!(
         entry.command.as_str(),
-        "git_reset" | "git_branch_delete" | "mv"
+        "git_reset" | "git_commit_amend" | "git_rebase" | "git_stash" | "git_branch_delete" | "mv"
     );
     if entry.is_undoable() && items.is_empty() && !snapshot_backed {
         missing.push("entry has no staged items".into());
@@ -573,6 +585,7 @@ pub fn status(journal: &Journal, paths: &Paths, config: &Config, as_json: bool) 
         .map(|meta| meta.len())
         .unwrap_or(0);
     let trash_bytes = tree_size(&paths.trash_dir)?;
+    let reserved_bytes = journal.active_reservations_bytes().unwrap_or(0);
     let wrappers = enabled_wrappers(config);
     let hook = installed_hook();
 
@@ -584,6 +597,7 @@ pub fn status(journal: &Journal, paths: &Paths, config: &Config, as_json: bool) 
             "journal_bytes": journal_bytes,
             "config": paths.config_path.display().to_string(),
             "trash_bytes": trash_bytes,
+            "reserved_bytes": reserved_bytes,
             "entries": stats.total_entries,
             "undoable": stats.undoable_entries,
             "undone": stats.undone_entries,
@@ -614,6 +628,9 @@ pub fn status(journal: &Journal, paths: &Paths, config: &Config, as_json: bool) 
         paths.trash_dir.display(),
         human_size(trash_bytes)
     );
+    if reserved_bytes > 0 {
+        println!("  reserved  {} (in-flight)", human_size(reserved_bytes));
+    }
     println!();
     print_stats(&stats);
     println!();
@@ -633,6 +650,13 @@ pub fn status(journal: &Journal, paths: &Paths, config: &Config, as_json: bool) 
             )
         }
     );
+    if config.trash.max_bytes > 0 && trash_bytes > config.trash.max_bytes {
+        eprintln!(
+            "rewind: warning: trash usage ({}) exceeds configured cap ({}); run 'rewind clean' to purge expired data",
+            human_size(trash_bytes),
+            human_size(config.trash.max_bytes)
+        );
+    }
     println!(
         "  wrappers  {}",
         if wrappers.is_empty() {
@@ -649,6 +673,9 @@ pub fn status(journal: &Journal, paths: &Paths, config: &Config, as_json: bool) 
             ("checkout", config.wrap.git_checkout),
             ("restore", config.wrap.git_restore),
             ("branch", config.wrap.git_branch_delete),
+            ("commit", config.wrap.git_commit_amend),
+            ("rebase", config.wrap.git_rebase),
+            ("stash", config.wrap.git_stash),
         ] {
             if enabled {
                 git_ops.push(name);
@@ -722,6 +749,7 @@ pub struct CleanOptions {
     pub older_than: Option<String>,
     pub all: bool,
     pub dry_run: bool,
+    pub json: bool,
 }
 
 /// Outcome of a cleaning pass.
@@ -763,24 +791,27 @@ pub fn clean(
                 .bytes
                 .saturating_add(tree_size(&paths.entry_dir(id)).unwrap_or(0));
         }
-        // Preview size-cap pruning.
+        // Preview size-cap status to stderr.
         if config.trash.max_bytes > 0 {
-            let sizes = journal.undoable_sizes()?;
-            let mut total: u64 = sizes.iter().map(|(_, _, size)| *size).sum();
-            let mut extra = 0usize;
-            for (_, _, size) in &sizes {
-                if total <= config.trash.max_bytes {
-                    break;
-                }
-                total = total.saturating_sub(*size);
-                extra += 1;
-            }
-            if extra > 0 {
-                println!(
-                    "rewind: would also purge {extra} older entries to respect the {} cap",
+            let total = journal.current_staged_bytes().unwrap_or(0);
+            if total > config.trash.max_bytes {
+                eprintln!(
+                    "rewind: warning: trash usage ({}) exceeds configured cap ({}); valid undo snapshots preserved",
+                    human_size(total),
                     human_size(config.trash.max_bytes)
                 );
             }
+        }
+        if options.json {
+            let out = json!({
+                "dry_run": true,
+                "entries": report.entries,
+                "bytes": report.bytes,
+                "all": options.all,
+                "cutoff": cutoff,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            return Ok(report);
         }
         println!(
             "rewind: would purge {} entr{} ({})",
@@ -799,20 +830,15 @@ pub fn clean(
         report.entries += 1;
     }
 
-    // Enforce the optional size cap, oldest entries first.
+    // Notify if trash still exceeds cap without auto-purging valid undoable entries.
     if config.trash.max_bytes > 0 {
-        let sizes = journal.undoable_sizes()?;
-        let mut total: u64 = sizes.iter().map(|(_, _, size)| *size).sum();
-        for (id, _, size) in sizes {
-            if total <= config.trash.max_bytes {
-                break;
-            }
-            journal.expire_entry(id)?;
-            let dir = paths.entry_dir(id);
-            report.bytes = report.bytes.saturating_add(tree_size(&dir).unwrap_or(0));
-            remove_tree(&dir)?;
-            total = total.saturating_sub(size);
-            report.entries += 1;
+        let total = journal.current_staged_bytes().unwrap_or(0);
+        if total > config.trash.max_bytes {
+            eprintln!(
+                "rewind: warning: trash usage ({}) exceeds configured cap ({}); valid undo snapshots preserved. Run 'rewind clean --all' to purge all snapshots.",
+                human_size(total),
+                human_size(config.trash.max_bytes)
+            );
         }
     }
 
@@ -823,6 +849,29 @@ pub fn clean(
 
     if report.entries > 0 {
         let _ = journal.vacuum();
+        match journal.wal_checkpoint() {
+            Ok(cp) if cp.busy => {
+                crate::engine::warn("WAL checkpoint could not fully truncate: database is busy");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                crate::engine::warn(&format!("WAL checkpoint error: {err}"));
+            }
+        }
+    }
+
+    if options.json {
+        let out = json!({
+            "dry_run": false,
+            "entries": report.entries,
+            "bytes": report.bytes,
+            "history_pruned": report.history_pruned,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        return Ok(report);
+    }
+
+    if report.entries > 0 {
         println!(
             "rewind: purged {} entr{} ({})",
             report.entries,

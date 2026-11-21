@@ -19,14 +19,29 @@ pub struct Sandbox {
 impl Sandbox {
     pub fn new() -> Self {
         let root = TempDir::new().expect("tempdir");
-        let home = root.path().join("home");
-        let work = root.path().join("work");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| root.path().to_path_buf());
+        let home = root_path.join("home");
+        let work = root_path.join("work");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&work).expect("work");
         Self {
             _root: root,
             home,
             work,
+        }
+    }
+
+    pub fn paths(&self) -> rewind::paths::Paths {
+        let data_dir = self.home.join(".local/share/rewind");
+        rewind::paths::Paths {
+            trash_dir: data_dir.join("trash"),
+            journal_path: data_dir.join("journal.db"),
+            lock_path: data_dir.join("rewind.lock"),
+            config_path: self.home.join(".config/rewind/config.toml"),
+            data_dir,
         }
     }
 
@@ -43,6 +58,25 @@ impl Sandbox {
             .env_remove("REWIND_CONFIG_PATH")
             .env_remove("REWIND_DISABLE");
         command
+    }
+
+    pub fn command_in(&self, subpath: &str) -> Command {
+        let mut command = self.command();
+        command.current_dir(self.path(subpath));
+        command
+    }
+
+    pub fn run_in(&self, subpath: &str, args: &[&str]) -> Output {
+        self.command_in(subpath)
+            .args(args)
+            .output()
+            .expect("running rewind in directory")
+    }
+
+    pub fn exec_in(&self, subpath: &str, command: &str, args: &[&str]) -> Output {
+        let mut full = vec!["exec", command, "--"];
+        full.extend_from_slice(args);
+        self.run_in(subpath, &full)
     }
 
     pub fn run(&self, args: &[&str]) -> Output {
@@ -192,6 +226,8 @@ impl Sandbox {
     /// Repository with one committed file (`tracked.txt` = "v1").
     pub fn init_repo(&self) {
         self.git_ok(&["init", "-q"]);
+        self.git_ok(&["config", "user.name", "Rewind Test"]);
+        self.git_ok(&["config", "user.email", "test@example.com"]);
         self.write("tracked.txt", "v1\n");
         self.git_ok(&["add", "."]);
         self.git_ok(&["commit", "-qm", "initial"]);

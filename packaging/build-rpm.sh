@@ -20,11 +20,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 with_vendor=0
-nocheck=0
+nocheck=""
 for arg in "$@"; do
     case "$arg" in
         --with-vendor) with_vendor=1 ;;
-        --nocheck) nocheck=1 ;;
+        --nocheck) nocheck="--nocheck" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -38,12 +38,19 @@ fi
 cp "$vendor_archive" "$work/$name-vendor.tar.xz"
 
 echo "==> creating source tarball"
-git -C "$root" archive --format=tar.gz --prefix="$name/" \
-    --output="$work/$name.tar.gz" HEAD
+export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
+if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$root" archive --format=tar.gz --prefix="$name/" \
+        --output="$work/$name.tar.gz" HEAD
+else
+    tar --exclude-vcs --exclude='./packaging/rpmbuild' --exclude='./packaging/*-vendor.tar.xz' \
+        --exclude='./target' --transform="s,^\.,$name," \
+        -C "$root" -czf "$work/$name.tar.gz" .
+fi
 
 echo "==> running rpmbuild"
 mkdir -p "$root/packaging/rpmbuild"/{SRPMS,RPMS}
-rpmbuild -ba ${nocheck:+--nocheck} "$root/packaging/rewind.spec" \
+rpmbuild -ba ${nocheck} "$root/packaging/rewind.spec" \
     --define "_sourcedir $work" \
     --define "_srcrpmdir $root/packaging/rpmbuild/SRPMS" \
     --define "_rpmdir $root/packaging/rpmbuild/RPMS" \

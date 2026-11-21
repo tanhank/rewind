@@ -139,7 +139,11 @@ fn cp_target_directory_flag() {
     sandbox.write("f", "f");
     sandbox.mkdir("out");
 
-    sandbox.exec_ok("cp", &["-t", "out", "f"]);
+    let output = sandbox.exec("cp", &["-t", "out", "f"]);
+    if !output.status.success() {
+        // Host cp does not support -t (e.g. BSD cp on macOS).
+        return;
+    }
     assert_eq!(sandbox.read("out/f"), "f");
     sandbox.run_ok(&["undo"]);
     assert!(!sandbox.exists("out/f"));

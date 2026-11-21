@@ -1,5 +1,7 @@
 //! CLI entry point.
 
+#![allow(clippy::collapsible_if)]
+
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
@@ -28,8 +30,20 @@ Then run `rewind undo`, `rewind log`, and `rewind status`.",
     after_help = "Docs: https://github.com/tanhank/rewind"
 )]
 struct Cli {
+    /// Control colored terminal output (auto, always, never)
+    #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default, Debug, PartialEq, Eq)]
+pub enum ColorChoice {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Subcommand)]
@@ -47,8 +61,11 @@ enum Commands {
     /// Reverse the last command, or the last N commands
     Undo {
         /// Number of journal entries to undo (newest first)
-        #[arg(default_value_t = 1)]
+        #[arg(default_value_t = 1, conflicts_with = "id")]
         n: usize,
+        /// Undo a specific journal entry by ID instead of the newest
+        #[arg(long, short = 'i', value_name = "ID")]
+        id: Option<i64>,
         /// Show what would be undone without changing anything
         #[arg(long)]
         dry_run: bool,
@@ -59,6 +76,15 @@ enum Commands {
         /// Maximum number of entries to show
         #[arg(long, short = 'n', default_value_t = 30)]
         limit: usize,
+        /// Filter history by command name (e.g. rm, mv, git_clean, git_reset)
+        #[arg(long = "cmd", short = 'c', value_name = "COMMAND")]
+        command: Option<String>,
+        /// Show only entries that can be undone right now
+        #[arg(long)]
+        undoable: bool,
+        /// Filter by entry status (done, undone, expired, failed, interrupted)
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -84,6 +110,9 @@ enum Commands {
         /// Show what would be purged without deleting anything
         #[arg(long)]
         dry_run: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show data locations, undo stack, and configuration summary
@@ -125,6 +154,8 @@ enum ConfigCommand {
     Path,
     /// Print the effective configuration
     Show,
+    /// List all known configuration keys and their current values
+    List,
     /// Print one value (for example wrap.rm)
     Get { key: String },
     /// Change one value and save the config
@@ -135,12 +166,45 @@ enum ConfigCommand {
     Edit,
 }
 
+struct IgnoreBrokenPipe<W>(W);
+
+impl<W: Write> Write for IgnoreBrokenPipe<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.write(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(buf.len()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.flush() {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match run() {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(err) => {
+            if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+                    return ExitCode::SUCCESS;
+                }
+            }
             eprintln!("rewind: {err:#}");
-            ExitCode::from(1)
+            if let Some(rewind_err) = err.downcast_ref::<rewind::Error>() {
+                ExitCode::from(rewind_err.exit_code() as u8)
+            } else {
+                ExitCode::from(1)
+            }
         }
     }
 }
@@ -152,15 +216,32 @@ fn run() -> Result<i32> {
 
     match cli.command {
         Commands::Exec { command, args } => run_exec(&paths, &config, &command, args),
-        Commands::Undo { n, dry_run } => {
+        Commands::Undo { n, id, dry_run } => {
             paths.ensure()?;
+            let _lock = paths.lock_exclusive(std::time::Duration::from_secs(30))?;
             let mut journal = Journal::open(&paths.journal_path)?;
-            let report = undo::run(&mut journal, &paths, n, dry_run)?;
+            let target = match id {
+                Some(entry_id) => undo::UndoTarget::Entry(entry_id),
+                None => undo::UndoTarget::Last(n),
+            };
+            let report = undo::run_target(&mut journal, &paths, target, dry_run)?;
             if report.failures > 0 { Ok(1) } else { Ok(0) }
         }
-        Commands::Log { limit, json } => {
+        Commands::Log {
+            limit,
+            command,
+            undoable,
+            status,
+            json,
+        } => {
             let journal = open_readonly(&paths)?;
-            commands::log(&journal, limit, json)?;
+            let filter = rewind::journal::LogFilter {
+                limit,
+                command,
+                undoable_only: undoable,
+                status,
+            };
+            commands::log(&journal, &filter, json)?;
             Ok(0)
         }
         Commands::Inspect { id, json } => {
@@ -172,8 +253,10 @@ fn run() -> Result<i32> {
             older_than,
             all,
             dry_run,
+            json,
         } => {
             paths.ensure()?;
+            let _lock = paths.lock_exclusive(std::time::Duration::from_secs(30))?;
             let mut journal = Journal::open(&paths.journal_path)?;
             commands::clean(
                 &mut journal,
@@ -183,6 +266,7 @@ fn run() -> Result<i32> {
                     older_than,
                     all,
                     dry_run,
+                    json,
                 },
             )?;
             Ok(0)
@@ -204,7 +288,8 @@ fn run() -> Result<i32> {
         }
         Commands::Completions { shell } => {
             let mut command = Cli::command();
-            clap_complete::generate(shell, &mut command, "rewind", &mut std::io::stdout());
+            let mut writer = IgnoreBrokenPipe(std::io::stdout());
+            clap_complete::generate(shell, &mut command, "rewind", &mut writer);
             Ok(0)
         }
         Commands::Config { command } => run_config(&paths, config, command),
@@ -280,6 +365,24 @@ fn run_config(paths: &Paths, mut config: Config, command: ConfigCommand) -> Resu
         ConfigCommand::Show => {
             println!("# {}", paths.config_path.display());
             print!("{}", toml::to_string_pretty(&config)?);
+        }
+        ConfigCommand::List => {
+            let doc: toml::Value = toml::from_str(&toml::to_string(&config)?)?;
+            for &key in Config::known_keys() {
+                let mut val = &doc;
+                let mut found = true;
+                for part in key.split('.') {
+                    if let Some(v) = val.get(part) {
+                        val = v;
+                    } else {
+                        found = false;
+                        break;
+                    }
+                }
+                if found {
+                    println!("{key} = {}", scalar(val));
+                }
+            }
         }
         ConfigCommand::Get { key } => {
             let document: toml::Value = toml::from_str(&toml::to_string(&config)?)?;

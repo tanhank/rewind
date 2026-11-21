@@ -811,6 +811,11 @@ fn git_clean_undo_handles_permission_restoration_failure_and_remains_resumable()
 
     #[cfg(unix)]
     {
+        // Root ignores directory permissions; skip permission failure assertion when running as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
         // Make the tracked parent read-only (0o555) so creating untracked_leaf fails
         sandbox.set_mode("parent", 0o555);
 
@@ -856,4 +861,475 @@ fn git_clean_undo_preserves_recreated_directory_contents_and_permissions() {
     assert_eq!(sandbox.read("custom_dir/work.txt"), "my new work\n");
     #[cfg(unix)]
     assert_eq!(sandbox.mode("custom_dir"), 0o750);
+}
+
+#[test]
+fn git_commit_amend_undo_restores_previous_commit_and_staged_changes() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+    let initial_head = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+
+    sandbox.write("added.txt", "amended content\n");
+    sandbox.git_ok(&["add", "added.txt"]);
+
+    sandbox.exec_ok("git", &["commit", "--amend", "-m", "amended commit"]);
+    let amended_head = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(initial_head, amended_head);
+    assert!(
+        sandbox
+            .git_ok(&["log", "-1", "--format=%s"])
+            .contains("amended commit")
+    );
+
+    sandbox.run_ok(&["undo"]);
+
+    let restored_head = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(restored_head, initial_head);
+    assert!(
+        !sandbox
+            .git_ok(&["log", "-1", "--format=%s"])
+            .contains("amended commit")
+    );
+    // Staged file is restored to index
+    assert!(
+        sandbox
+            .git_ok(&["status", "--porcelain"])
+            .contains("A  added.txt")
+    );
+}
+
+#[test]
+fn git_stash_drop_undo_restores_dropped_stash() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+    sandbox.write("tracked.txt", "wip stash content\n");
+    sandbox.git_ok(&["stash", "push", "-m", "important stash"]);
+    assert!(
+        sandbox
+            .git_ok(&["stash", "list"])
+            .contains("important stash")
+    );
+
+    sandbox.exec_ok("git", &["stash", "drop"]);
+    assert!(
+        !sandbox
+            .git_ok(&["stash", "list"])
+            .contains("important stash")
+    );
+
+    sandbox.run_ok(&["undo"]);
+    assert!(
+        sandbox
+            .git_ok(&["stash", "list"])
+            .contains("important stash")
+    );
+}
+
+#[test]
+fn git_stash_drop_middle_preserves_exact_order() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    sandbox.write("tracked.txt", "stash A content\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash A"]);
+    sandbox.write("tracked.txt", "stash B content\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash B"]);
+    sandbox.write("tracked.txt", "stash C content\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash C"]);
+
+    // Stack is C (stash@{0}), B (stash@{1}), A (stash@{2})
+    let list_before = sandbox.git_ok(&["stash", "list"]);
+    let lines: Vec<&str> = list_before.lines().collect();
+    assert!(lines[0].contains("stash C"));
+    assert!(lines[1].contains("stash B"));
+    assert!(lines[2].contains("stash A"));
+
+    // Drop middle stash B
+    sandbox.exec_ok("git", &["stash", "drop", "stash@{1}"]);
+    let list_after_drop = sandbox.git_ok(&["stash", "list"]);
+    let drop_lines: Vec<&str> = list_after_drop.lines().collect();
+    assert_eq!(drop_lines.len(), 2);
+    assert!(drop_lines[0].contains("stash C"));
+    assert!(drop_lines[1].contains("stash A"));
+
+    // Undo should restore exact original order: C @ 0, B @ 1, A @ 2
+    sandbox.run_ok(&["undo"]);
+    let list_restored = sandbox.git_ok(&["stash", "list"]);
+    let restored_lines: Vec<&str> = list_restored.lines().collect();
+    assert_eq!(restored_lines.len(), 3);
+    assert!(restored_lines[0].contains("stash C"), "0 should be C");
+    assert!(restored_lines[1].contains("stash B"), "1 should be B");
+    assert!(restored_lines[2].contains("stash A"), "2 should be A");
+}
+
+#[test]
+fn git_stash_drop_with_subsequent_stash_preserved_on_top() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    sandbox.write("tracked.txt", "stash A\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash A"]);
+    sandbox.write("tracked.txt", "stash B\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash B"]);
+
+    // Drop B
+    sandbox.exec_ok("git", &["stash", "drop"]);
+
+    // User creates new stash C before undoing
+    sandbox.write("tracked.txt", "stash C\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash C"]);
+
+    // Undo should keep C on top, and restore B, A below it: C @ 0, B @ 1, A @ 2
+    sandbox.run_ok(&["undo"]);
+    let list = sandbox.git_ok(&["stash", "list"]);
+    let lines: Vec<&str> = list.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].contains("stash C"), "top must be newly added C");
+    assert!(lines[1].contains("stash B"), "middle must be restored B");
+    assert!(lines[2].contains("stash A"), "bottom must be A");
+}
+
+#[test]
+fn git_stash_clear_undo_restores_entire_stash_stack() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+    sandbox.write("tracked.txt", "stash one content\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash 1"]);
+    sandbox.write("tracked.txt", "stash two content\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash 2"]);
+
+    let before = sandbox.git_ok(&["stash", "list"]);
+    assert!(before.contains("stash 1") && before.contains("stash 2"));
+
+    sandbox.exec_ok("git", &["stash", "clear"]);
+    assert_eq!(sandbox.git_ok(&["stash", "list"]).trim(), "");
+
+    // Add a new stash 3 while cleared
+    sandbox.write("tracked.txt", "stash three content\n");
+    sandbox.git_ok(&["stash", "push", "-m", "stash 3"]);
+
+    sandbox.run_ok(&["undo"]);
+    let after = sandbox.git_ok(&["stash", "list"]);
+    let lines: Vec<&str> = after.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].contains("stash 3"));
+    assert!(lines[1].contains("stash 2"));
+    assert!(lines[2].contains("stash 1"));
+}
+
+#[test]
+fn git_stash_pop_undo_full_restoration() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    // Create a stash with tracked modification and untracked file (-u)
+    sandbox.write("tracked.txt", "stashed tracked content\n");
+    sandbox.write("untracked.txt", "stashed untracked content\n");
+    sandbox.git_ok(&["stash", "push", "-u", "-m", "pop full test"]);
+    assert!(sandbox.git_ok(&["stash", "list"]).contains("pop full test"));
+    assert!(!sandbox.exists("untracked.txt"));
+
+    // Current working directory is clean at initial commit
+    assert_eq!(sandbox.read("tracked.txt"), "v1\n");
+
+    // Pop the stash via rewind exec git stash pop
+    sandbox.exec_ok("git", &["stash", "pop"]);
+    assert!(!sandbox.git_ok(&["stash", "list"]).contains("pop full test"));
+    assert_eq!(sandbox.read("tracked.txt"), "stashed tracked content\n");
+    assert_eq!(sandbox.read("untracked.txt"), "stashed untracked content\n");
+
+    // Undo the pop
+    sandbox.run_ok(&["undo"]);
+
+    // Verify BOTH effects are reversed:
+    // 1. Working tree and untracked files are reverted to pre-pop state
+    assert_eq!(sandbox.read("tracked.txt"), "v1\n");
+    assert!(
+        !sandbox.exists("untracked.txt"),
+        "untracked file brought in by pop must be removed"
+    );
+
+    // 2. The stash entry is restored back to refs/stash
+    let list = sandbox.git_ok(&["stash", "list"]);
+    assert!(
+        list.contains("pop full test"),
+        "stash must be restored in refs/stash"
+    );
+}
+
+#[test]
+fn git_stash_pop_with_conflict_does_not_record_undo_entry() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    // Create stash with conflicting change
+    sandbox.write("tracked.txt", "conflict from stash\n");
+    sandbox.git_ok(&["stash", "push", "-m", "conflict stash"]);
+
+    // Commit a different change to tracked.txt
+    sandbox.write("tracked.txt", "conflict from commit\n");
+    sandbox.git_ok(&["commit", "-am", "conflicting commit"]);
+
+    // Attempt to pop stash -> git produces conflict and keeps stash entry
+    let output = sandbox.exec("git", &["stash", "pop"]);
+    assert!(
+        !output.status.success(),
+        "pop with conflict must exit with error"
+    );
+
+    // Git keeps the stash entry on conflict
+    assert!(
+        sandbox
+            .git_ok(&["stash", "list"])
+            .contains("conflict stash"),
+        "git retains stash on conflict"
+    );
+
+    // Rewind must NOT have recorded a false undoable entry
+    let undo_out = sandbox.run(&["undo"]);
+    assert!(
+        !undo_out.status.success()
+            || stderr_of(&undo_out).contains("nothing to undo")
+            || stdout_of(&undo_out).contains("nothing to undo"),
+        "must not record undoable entry for conflicted pop"
+    );
+}
+
+#[test]
+fn git_rebase_undo_restores_pre_rebase_commit() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    // Create feature branch with commit B
+    sandbox.git_ok(&["checkout", "-b", "feature"]);
+    sandbox.write("feature.txt", "feature\n");
+    sandbox.git_ok(&["add", "feature.txt"]);
+    sandbox.git_ok(&["commit", "-m", "feature commit"]);
+    let pre_rebase_feature = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+
+    // Switch to main and add commit C
+    sandbox.git_ok(&["checkout", "main"]);
+    sandbox.write("main.txt", "main\n");
+    sandbox.git_ok(&["add", "main.txt"]);
+    sandbox.git_ok(&["commit", "-m", "main commit"]);
+
+    // Switch back to feature and rebase
+    sandbox.git_ok(&["checkout", "feature"]);
+    sandbox.exec_ok("git", &["rebase", "main"]);
+
+    let post_rebase_feature = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(pre_rebase_feature, post_rebase_feature);
+    assert!(sandbox.exists("main.txt"));
+
+    sandbox.run_ok(&["undo"]);
+
+    let restored_feature = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(restored_feature, pre_rebase_feature);
+    assert!(!sandbox.exists("main.txt"));
+}
+
+#[test]
+fn git_merge_abort_clean_passthrough_and_no_undo() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    sandbox.git_ok(&["checkout", "-b", "feature"]);
+    sandbox.write("tracked.txt", "feature content\n");
+    sandbox.git_ok(&["commit", "-am", "feature commit"]);
+
+    sandbox.git_ok(&["checkout", "main"]);
+    sandbox.write("tracked.txt", "main content\n");
+    sandbox.git_ok(&["commit", "-am", "main commit"]);
+
+    // Attempt merge -> conflict
+    let _ = sandbox.exec("git", &["merge", "feature"]);
+    assert!(sandbox.git_ok(&["status", "--porcelain"]).contains("UU"));
+
+    // Abort merge via rewind exec git merge --abort (honest boundary passthrough)
+    let abort_out = sandbox.exec("git", &["merge", "--abort"]);
+    assert!(abort_out.status.success());
+    assert_eq!(sandbox.read("tracked.txt"), "main content\n");
+
+    // Rewind should not have recorded an undo entry for merge --abort
+    let journal = rewind::journal::Journal::open_query_only(&sandbox.paths().journal_path).unwrap();
+    let entries = journal.list(10, true).unwrap();
+    assert!(!entries.iter().any(|e| e.command == "git_merge_abort"));
+}
+
+#[test]
+fn git_rebase_abort_clean_passthrough_and_no_undo() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    sandbox.git_ok(&["checkout", "-b", "feature"]);
+    sandbox.write("tracked.txt", "feature content\n");
+    sandbox.git_ok(&["commit", "-am", "feature commit"]);
+
+    sandbox.git_ok(&["checkout", "main"]);
+    sandbox.write("tracked.txt", "main content\n");
+    sandbox.git_ok(&["commit", "-am", "main commit"]);
+
+    // Attempt rebase -> conflict
+    sandbox.git_ok(&["checkout", "feature"]);
+    let _ = sandbox.exec("git", &["rebase", "main"]);
+    assert!(
+        sandbox.path(".git/rebase-merge").exists() || sandbox.path(".git/rebase-apply").exists()
+    );
+
+    // Abort rebase via rewind exec git rebase --abort (honest boundary passthrough)
+    let abort_out = sandbox.exec("git", &["rebase", "--abort"]);
+    assert!(abort_out.status.success());
+    assert_eq!(sandbox.read("tracked.txt"), "feature content\n");
+
+    // Rewind should not have recorded an undo entry for rebase --abort
+    let journal = rewind::journal::Journal::open_query_only(&sandbox.paths().journal_path).unwrap();
+    let entries = journal.list(10, true).unwrap();
+    assert!(!entries.iter().any(|e| e.command == "git_rebase_abort"));
+}
+
+#[test]
+fn git_linked_worktree_reset_hard_undo() {
+    if !git_available() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.init_repo();
+
+    // Commit 2 on main
+    sandbox.write("c2.txt", "commit 2\n");
+    sandbox.git_ok(&["add", "c2.txt"]);
+    sandbox.git_ok(&["commit", "-m", "commit 2"]);
+    let main_head_c2 = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+
+    // Add linked worktree
+    let wt_path = sandbox.path("wt_dir");
+    sandbox.git_ok(&[
+        "worktree",
+        "add",
+        wt_path.to_str().unwrap(),
+        "-b",
+        "wt_branch",
+    ]);
+
+    // Commit 3 in linked worktree
+    sandbox.write("wt_dir/wt_file.txt", "wt content\n");
+    let output = std::process::Command::new("git")
+        .args(["add", "wt_file.txt"])
+        .current_dir(&wt_path)
+        .env("HOME", &sandbox.home)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Rewind Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "wt commit 3",
+        ])
+        .current_dir(&wt_path)
+        .env("HOME", &sandbox.home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git commit in linked worktree failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wt_head_c3 = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt_path)
+            .env("HOME", &sandbox.home)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(main_head_c2, wt_head_c3);
+
+    // In linked worktree: execute git reset --hard HEAD~1 via rewind
+    let reset_out = sandbox.exec_in("wt_dir", "git", &["reset", "--hard", "HEAD~1"]);
+    assert!(reset_out.status.success());
+
+    let wt_head_after_reset = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt_path)
+            .env("HOME", &sandbox.home)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(wt_head_after_reset, main_head_c2);
+
+    // Run undo in linked worktree
+    let undo_out = sandbox.run_in("wt_dir", &["undo"]);
+    assert!(
+        undo_out.status.success(),
+        "undo in linked worktree must succeed"
+    );
+
+    let wt_head_restored = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt_path)
+            .env("HOME", &sandbox.home)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(
+        wt_head_restored, wt_head_c3,
+        "linked worktree HEAD must be fully restored"
+    );
+
+    // Main repo HEAD is still main_head_c2
+    let main_head_now = sandbox.git_ok(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        main_head_now, main_head_c2,
+        "main repo must remain unaffected"
+    );
 }

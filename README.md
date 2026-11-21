@@ -93,7 +93,7 @@ The APT repository carries static `amd64` and `arm64` packages and works across 
 
 Distro packages install the hooks under `/usr/share/rewind/` and completions in the standard shell directories.
 
-**Cargo** requires Rust 1.85 or newer:
+**Cargo** requires Rust 1.89 or newer:
 
 ```bash
 cargo install --git https://github.com/tanhank/rewind --locked

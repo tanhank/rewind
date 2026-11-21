@@ -11,12 +11,16 @@
 //! * [`undo`] replays a journal entry backwards.
 //! * [`commands`] implements `log`, `status`, and `clean`.
 
+#![allow(clippy::collapsible_if)]
+
 pub mod commands;
 pub mod config;
 pub mod engine;
 pub mod error;
 pub mod journal;
+pub mod lock;
 pub mod paths;
+pub mod redact;
 pub mod staging;
 pub mod undo;
 pub mod util;

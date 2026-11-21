@@ -28,7 +28,7 @@ if command -q rewind
 
     function git
         switch $argv[1]
-            case reset clean checkout restore branch
+            case reset clean checkout restore branch commit rebase stash
                 __rewind_run git $argv
             case '*'
                 command git $argv
