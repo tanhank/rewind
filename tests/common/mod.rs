@@ -19,8 +19,12 @@ pub struct Sandbox {
 impl Sandbox {
     pub fn new() -> Self {
         let root = TempDir::new().expect("tempdir");
-        let home = root.path().join("home");
-        let work = root.path().join("work");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| root.path().to_path_buf());
+        let home = root_path.join("home");
+        let work = root_path.join("work");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&work).expect("work");
         Self {
