@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,13 +14,23 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            use_cross: false
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            use_cross: false
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +40,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross
+        if: matrix.use_cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
@@ -39,8 +50,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build static binary
+      - name: Build binary with cross
+        if: matrix.use_cross
         run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build binary natively
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -68,6 +84,8 @@ jobs:
     name: publish GitHub release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 

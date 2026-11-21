@@ -22,8 +22,11 @@ and the destructive git operations
 .BR clean ,
 .BR checkout ,
 .BR restore ,
+.BR branch \fR(\fB\-d\fR/\fB\-D\fR),
+.BR commit \fR(\fB\-\-amend\fR),
+.BR rebase ,
 and
-.BR branch \fR(\fB\-d\fR/\fB\-D\fR).
+.BR stash \fR(\fBdrop\fR/\fBclear\fR/\fBpop\fR).
 Interception is performed by shell functions installed by
 .BR "rewind init" ;
 the binary itself can also be invoked directly with
@@ -34,12 +37,12 @@ restored successfully are removed from the journal immediately, so a partial
 failure can be repaired and retried without re\-restoring completed items.
 .SH COMMANDS
 .TP
-.B undo \fR[\fIN\fR] [\fB\-\-dry\-run\fR]
-Reverse the last \fIN\fR journal entries (default 1), newest first. With
+.B undo \fR[\fIN\fR] [\fB\-i\fR|\fB\-\-id\fR \fIID\fR] [\fB\-\-dry\-run\fR]
+Reverse the last \fIN\fR journal entries (default 1), newest first, or reverse a specific entry by its journal \fIID\fR. With
 \fB\-\-dry\-run\fR, print what would be restored without changing anything.
 .TP
-.B log \fR[\fB\-n\fR \fILIMIT\fR] [\fB\-\-json\fR]
-Show undo history. The default limit is 30 entries. JSON output includes the
+.B log \fR[\fB\-n\fR \fILIMIT\fR] [\fB\-c\fR|\fB\-\-cmd\fR \fICOMMAND\fR] [\fB\-\-undoable\fR] [\fB\-\-status\fR \fISTATUS\fR] [\fB\-\-json\fR]
+Show undo history. The default limit is 30 entries. Filter entries by command name with \fB\-\-cmd\fR, limit to reversible entries with \fB\-\-undoable\fR, or filter by status with \fB\-\-status\fR. JSON output includes the
 full command, working directory, status, exit code, item count, and staged
 bytes.
 .TP
@@ -48,13 +51,13 @@ Inspect one journal entry, its staged items, and recovery readiness without
 restoring anything. With \fB\-\-json\fR, emit machine\-readable JSON.
 .TP
 .B status \fR[\fB\-\-json\fR]
-Show data locations, undo stack depth, retention settings, enabled wrappers,
+Show data locations, undo stack depth, retention settings, active capacity reservations, enabled wrappers,
 and whether a shell hook was found.
 .TP
-.B clean \fR[\fB\-\-older\-than\fR \fIDURATION\fR] [\fB\-\-all\fR] [\fB\-\-dry\-run\fR]
+.B clean \fR[\fB\-\-older\-than\fR \fIDURATION\fR] [\fB\-\-all\fR] [\fB\-\-dry\-run\fR] [\fB\-\-json\fR]
 Purge staged files older than the retention period, or enforce the configured
 size cap. Durations accept the suffixes s, m, h, d, and w. History rows are
-kept and marked \fBexpired\fR.
+kept and marked \fBexpired\fR. With \fB\-\-json\fR, emit machine\-readable statistics.
 .TP
 .B init \fR{\fBbash\fR|\fBzsh\fR|\fBfish\fR}
 Print the shell integration script to standard output. Typical installation:
@@ -70,13 +73,17 @@ rewind init fish | source             # ~/.config/fish/config.fish
 .B completions \fR{\fBbash\fR|\fBzsh\fR|\fBfish\fR|\fBelvish\fR|\fBpowershell\fR}
 Print shell completions to standard output.
 .TP
-.B config \fR{\fBpath\fR|\fBshow\fR|\fBget\fR \fIKEY\fR|\fBset\fR \fIKEY\fR \fIVALUE\fR|\fBinit\fR|\fBedit\fR}
-Inspect or change configuration. Boolean values accept
+.B config \fR{\fBpath\fR|\fBshow\fR|\fBlist\fR|\fBget\fR \fIKEY\fR|\fBset\fR \fIKEY\fR \fIVALUE\fR|\fBinit\fR|\fBedit\fR}
+Inspect or change configuration. \fBconfig list\fR displays all known configuration keys and their current values. Boolean values accept
 \fItrue/false\fR, \fIyes/no\fR, \fIon/off\fR, and \fI1/0\fR.
 .TP
 .B exec \fICOMMAND\fR \fB\-\-\fR \fIARGS\fR...
 Execute a wrapped command. This is the entry point used by the shell hooks and
 is hidden from the normal help output.
+.SH OPTIONS
+.TP
+.B \-\-color \fR{\fBauto\fR|\fBalways\fR|\fBnever\fR}
+Control colored output. Defaults to \fBauto\fR, which suppresses colors when stdout is redirected or \fBNO_COLOR\fR is set.
 .SH CONFIGURATION
 Configuration is optional. Defaults enable every wrapper and keep trash for
 30 days. The file is read from
@@ -89,13 +96,18 @@ Recognized keys:
 .nf
 wrap.rm, wrap.mv, wrap.cp, wrap.chmod, wrap.chown, wrap.git
 wrap.git_reset, wrap.git_clean, wrap.git_checkout, wrap.git_restore, wrap.git_branch_delete
+wrap.git_commit_amend, wrap.git_rebase, wrap.git_stash
 trash.retention_days (0 disables automatic expiry)
-trash.max_bytes (0 means unlimited)
+trash.max_bytes (0 means unlimited, default 10 GiB)
+trash.exclude_patterns (comma-separated globs, e.g. *.env,*.key)
 journal.keep_days (0 keeps history forever)
 git.snapshot_untracked, git.keep_refs
 .fi
 .RE
 .SH ENVIRONMENT
+.TP
+.B NO_COLOR
+When set (regardless of value), disables color formatting in terminal output.
 .TP
 .B REWIND_DISABLE
 When set to \fB1\fR, \fBtrue\fR, or \fByes\fR, the shell hook and
@@ -128,10 +140,24 @@ Per\-entry staged data, created with mode 0700.
 Optional configuration.
 .SH EXIT STATUS
 .B rewind
-itself exits 0 on success, 1 when an undo is incomplete or a command fails,
-and 2 for command\-line usage errors. Wrapped commands preserve their native
-exit status. \fBrewind undo\fR exits 1 if any entry could not be fully
-restored.
+exits with standard Unix exit status codes:
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General runtime failure or incomplete undo operation.
+.TP
+.B 2
+Command-line usage error, invalid option, or unparseable argument.
+.TP
+.B 3
+Operation deliberately refused (such as storage capacity cap exceeded, or destination path conflict during undo).
+.TP
+.B 127
+Wrapped command binary was not found in PATH.
+.PP
+Wrapped commands executing via \fBexec\fR preserve their byte\-for\-byte native exit status.
 .SH SAFETY
 rewind refuses to stage or delete its own data directory or any ancestor
 thereof. Undo refuses to overwrite a path that has been recreated since the

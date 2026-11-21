@@ -6,8 +6,10 @@
 //! variables, which is what the integration tests do.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::{Error, IoContext, Result};
+use crate::lock::ProcessLock;
 
 /// Resolved locations for all on-disk state.
 #[derive(Debug, Clone)]
@@ -84,16 +86,38 @@ impl Paths {
             self.journal_path.display()
         )
     }
+
+    /// Acquire an exclusive inter-process lock for `undo` or `clean`.
+    pub fn lock_exclusive(&self, timeout: Duration) -> Result<ProcessLock> {
+        self.ensure()?;
+        ProcessLock::acquire_exclusive(&self.lock_path, timeout)
+    }
+
+    /// Acquire a shared inter-process lock for command staging/reconciliation.
+    pub fn lock_shared(&self, timeout: Duration) -> Result<ProcessLock> {
+        self.ensure()?;
+        ProcessLock::acquire_shared(&self.lock_path, timeout)
+    }
 }
 
 /// Create a directory (and parents) restricted to the current user on Unix.
 pub fn create_private_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path).path_context(path)?;
+    if !path.exists() {
+        std::fs::create_dir_all(path).path_context(path)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(path, perms).path_context(path)?;
+        if let Err(err) = std::fs::set_permissions(path, perms) {
+            // Do not fail if path is an existing shared/system directory like /tmp
+            if err.raw_os_error() != Some(libc::EPERM) {
+                return Err(Error::Io {
+                    context: format!("setting permissions on {}", path.display()),
+                    source: err,
+                });
+            }
+        }
     }
     Ok(())
 }

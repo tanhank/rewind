@@ -49,12 +49,19 @@ pub fn execute(
         "checkout" => checkout(journal, paths, argv),
         "restore" => restore(journal, paths, argv),
         "branch" => branch(journal, paths, config, argv),
+        "commit" => commit(journal, paths, config, argv),
+        "stash" => stash(journal, paths, config, argv),
+        "rebase" => rebase(journal, paths, config, argv),
+        "merge" => merge(journal, paths, config, argv),
         _ => run_passthrough("git", argv),
     }
 }
 
 struct Repo {
     root: PathBuf,
+    git_dir: PathBuf,
+    #[allow(dead_code)]
+    common_dir: PathBuf,
     cwd: PathBuf,
 }
 
@@ -62,7 +69,12 @@ impl Repo {
     fn discover() -> Option<Self> {
         let cwd = std::env::current_dir().ok()?;
         let output = Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
+            .args([
+                "rev-parse",
+                "--show-toplevel",
+                "--git-dir",
+                "--git-common-dir",
+            ])
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -71,12 +83,36 @@ impl Repo {
         if !output.status.success() {
             return None;
         }
-        let root = String::from_utf8(output.stdout).ok()?;
-        let root = PathBuf::from(root.trim());
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut lines = stdout.lines();
+        let root_str = lines.next()?.trim();
+        let git_dir_str = lines.next()?.trim();
+        let common_dir_str = lines.next()?.trim();
+
+        let root = PathBuf::from(root_str);
         if root.as_os_str().is_empty() {
             return None;
         }
-        Some(Self { root, cwd })
+
+        let resolve_dir = |raw: &str| -> PathBuf {
+            let p = Path::new(raw);
+            let joined = if p.is_relative() {
+                cwd.join(p)
+            } else {
+                p.to_path_buf()
+            };
+            std::fs::canonicalize(&joined).unwrap_or(joined)
+        };
+
+        let git_dir = resolve_dir(git_dir_str);
+        let common_dir = resolve_dir(common_dir_str);
+
+        Some(Self {
+            root,
+            git_dir,
+            common_dir,
+            cwd,
+        })
     }
 
     /// Run git in the user's original working directory.
@@ -150,7 +186,7 @@ impl Repo {
 // git reset --hard
 // ---------------------------------------------------------------------------
 
-fn reset(journal: &mut Journal, _paths: &Paths, config: &Config, argv: &[String]) -> Result<i32> {
+fn reset(journal: &mut Journal, paths: &Paths, config: &Config, argv: &[String]) -> Result<i32> {
     let destructive = argv
         .iter()
         .skip(1)
@@ -171,8 +207,8 @@ fn reset(journal: &mut Journal, _paths: &Paths, config: &Config, argv: &[String]
     let index_tree = repo.text(&["write-tree"])?;
     let stash = repo.text(&["stash", "create"])?;
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
     let entry_id = journal.begin_entry("git_reset", argv, &repo.cwd)?;
-
     let mut refs: Vec<String> = Vec::new();
     if let Err(err) = pin_ref(&repo, entry_id, "head", &head) {
         warn(&format!("could not pin HEAD snapshot: {err}"));
@@ -194,6 +230,7 @@ fn reset(journal: &mut Journal, _paths: &Paths, config: &Config, argv: &[String]
 
     let meta = json!({
         "repo": repo.root.display().to_string(),
+        "git_dir": repo.git_dir.display().to_string(),
         "head": head,
         "branch": branch,
         "index_tree": index_tree,
@@ -243,6 +280,23 @@ pub fn undo_reset(entry: &Entry) -> Result<()> {
     let repo_path = PathBuf::from(repo);
     if !repo_path.exists() {
         return Err(Error::Git(format!("repository no longer exists: {repo}")));
+    }
+
+    let git_dir = entry
+        .meta
+        .get("git_dir")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_path.join(".git"));
+
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        let _ = Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(&repo_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 
     let branch = entry.meta.get("branch").and_then(|v| v.as_str());
@@ -301,6 +355,192 @@ pub fn undo_reset(entry: &Entry) -> Result<()> {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_stash_stack(repo: &Repo) -> Result<Vec<(String, String)>> {
+    let output = repo.git(&["log", "-g", "--format=%H\t%s", "refs/stash"])?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut stashes = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (commit, msg) = match trimmed.split_once('\t') {
+            Some((c, m)) => (c.to_string(), m.to_string()),
+            None => (trimmed.to_string(), String::new()),
+        };
+        stashes.push((commit, msg));
+    }
+    Ok(stashes)
+}
+
+fn restore_stash_stack(repo_path: &Path, pre_stack: &[(String, String)]) -> Result<()> {
+    if pre_stack.is_empty() {
+        return Ok(());
+    }
+    let output = Command::new("git")
+        .args(["log", "-g", "--format=%H\t%s", "refs/stash"])
+        .current_dir(repo_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| Error::Git(format!("running git log refs/stash: {err}")))?;
+
+    let mut curr_stack = Vec::new();
+    if output.status.success() {
+        let raw = String::from_utf8_lossy(&output.stdout);
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (commit, msg) = match trimmed.split_once('\t') {
+                Some((c, m)) => (c.to_string(), m.to_string()),
+                None => (trimmed.to_string(), String::new()),
+            };
+            curr_stack.push((commit, msg));
+        }
+    }
+
+    let pre_commits: std::collections::HashSet<&str> =
+        pre_stack.iter().map(|(c, _)| c.as_str()).collect();
+
+    let new_stashes: Vec<(String, String)> = curr_stack
+        .into_iter()
+        .filter(|(c, _)| !pre_commits.contains(c.as_str()))
+        .collect();
+
+    let mut target_stack = new_stashes;
+    target_stack.extend_from_slice(pre_stack);
+
+    let _ = Command::new("git")
+        .args(["update-ref", "-d", "refs/stash"])
+        .current_dir(repo_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    for (commit, msg) in target_stack.iter().rev() {
+        let output = Command::new("git")
+            .args(["stash", "store", "-m", msg, commit])
+            .current_dir(repo_path)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|err| Error::Git(format!("running git stash store: {err}")))?;
+        if !output.status.success() {
+            return Err(Error::Git(format!(
+                "git stash store failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Restore dropped, cleared, or popped stashes. Called by `undo`.
+pub fn undo_stash(entry: &Entry) -> Result<()> {
+    let repo = entry
+        .meta
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Git("stash entry has no repository path".into()))?;
+    let repo_path = PathBuf::from(repo);
+    if !repo_path.exists() {
+        return Err(Error::Git(format!("repository no longer exists: {repo}")));
+    }
+    let role = entry
+        .meta
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stash");
+
+    if role == "stash_pop" {
+        if let Some(untracked) = entry.meta.get("untracked_files").and_then(|v| v.as_array()) {
+            for item in untracked.iter().filter_map(|v| v.as_str()) {
+                let file_path = repo_path.join(item);
+                if file_path.symlink_metadata().is_ok() {
+                    let _ = std::fs::remove_file(&file_path);
+                }
+            }
+        }
+
+        if let Some(head) = entry.meta.get("head").and_then(|v| v.as_str()) {
+            let branch = entry.meta.get("branch").and_then(|v| v.as_str());
+            if let Some(branch) = branch {
+                let branch_exists = git_succeeds(
+                    &repo_path,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{branch}"),
+                    ],
+                );
+                if branch_exists {
+                    git_must(&repo_path, &["checkout", "-q", "-f", branch])?;
+                } else {
+                    git_must(&repo_path, &["checkout", "-q", "-f", "--detach", head])?;
+                }
+            } else {
+                git_must(&repo_path, &["checkout", "-q", "-f", "--detach", head])?;
+            }
+            git_must(&repo_path, &["reset", "--hard", head])?;
+        }
+
+        if let Some(stash_state) = entry.meta.get("stash_state").and_then(|v| v.as_str()) {
+            let output = Command::new("git")
+                .args(["stash", "apply", "--index", stash_state])
+                .current_dir(&repo_path)
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|err| Error::Git(format!("running git stash apply: {err}")))?;
+            if !output.status.success() {
+                return Err(Error::Git(format!(
+                    "could not reapply pre-pop uncommitted changes: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        } else if let Some(tree) = entry.meta.get("index_tree").and_then(|v| v.as_str()) {
+            git_must(&repo_path, &["read-tree", tree])?;
+        }
+    }
+
+    let pre_stack_val = entry
+        .meta
+        .get("pre_stack")
+        .or_else(|| entry.meta.get("stashes"))
+        .and_then(|v| v.as_array());
+
+    if let Some(items) = pre_stack_val {
+        let mut pre_stack = Vec::new();
+        for item in items {
+            let commit = item.get("commit").and_then(|v| v.as_str()).unwrap_or("");
+            let msg = item.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if !commit.is_empty() {
+                pre_stack.push((commit.to_string(), msg.to_string()));
+            }
+        }
+        restore_stash_stack(&repo_path, &pre_stack)?;
+    }
+
+    if !entry
+        .meta
+        .get("keep_refs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        if let Some(refs) = entry.meta.get("refs").and_then(|v| v.as_array()) {
+            for reference in refs.iter().filter_map(|v| v.as_str()) {
+                let _ = delete_ref(&repo_path, reference);
             }
         }
     }
@@ -403,6 +643,7 @@ fn clean(journal: &mut Journal, paths: &Paths, _config: &Config, argv: &[String]
         directory_candidates.dedup();
     }
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
     let entry_id = journal.begin_entry("git_clean", argv, &repo.cwd)?;
     let stager = Stager::new(paths, entry_id);
     let mut rows: Vec<(i64, PathBuf)> = Vec::new();
@@ -439,14 +680,33 @@ fn clean(journal: &mut Journal, paths: &Paths, _config: &Config, argv: &[String]
         }
     }
 
+    let mut estimated_incoming = 0u64;
+    for relative in &candidates {
+        if let Some(abs) = repo.absolute(relative) {
+            if abs.symlink_metadata().is_ok() && !_config.trash.is_excluded(&abs) {
+                estimated_incoming =
+                    estimated_incoming.saturating_add(crate::staging::tree_size(&abs).unwrap_or(0));
+            }
+        }
+    }
+    if let Err(err) = journal.reserve_capacity(
+        entry_id,
+        estimated_incoming,
+        _config.trash.max_bytes,
+        _config.trash.retention_days,
+    ) {
+        journal.delete_entry(entry_id)?;
+        return Err(err);
+    }
+
     for relative in &candidates {
         let Some(absolute) = repo.absolute(relative) else {
             continue;
         };
-        if absolute.symlink_metadata().is_err() {
+        if absolute.symlink_metadata().is_err() || _config.trash.is_excluded(&absolute) {
             continue;
         }
-        match stager.snapshot(&absolute, SnapshotMode::Hardlink) {
+        match stager.snapshot(&absolute, SnapshotMode::Clone) {
             Ok(payload) => {
                 let item = NewStaged::new(
                     absolute.display().to_string(),
@@ -607,57 +867,40 @@ fn parse_clean(args: &[String]) -> Option<CleanOptions> {
         excludes: Vec::new(),
         pathspecs: Vec::new(),
     };
-    let mut iter = args.iter();
-    let mut only_paths = false;
-    while let Some(arg) = iter.next() {
-        if only_paths {
-            options.pathspecs.push(arg.clone());
-            continue;
-        }
-        if arg == "--" {
-            only_paths = true;
-            continue;
-        }
-        if !arg.starts_with('-') {
-            options.pathspecs.push(arg.clone());
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, inline) = match long.split_once('=') {
-                Some((name, value)) => (name, Some(value.to_string())),
-                None => (long, None),
-            };
-            match name {
+    let mut scanner = super::args::ArgScanner::new(args);
+    while let Some(token) = scanner.next_token() {
+        match token {
+            super::args::ArgToken::Operand(op) => {
+                options.pathspecs.push(op.to_string());
+            }
+            super::args::ArgToken::Long { name, inline_value } => match name {
                 "force" => options.force = true,
                 "dry-run" => options.dry_run = true,
                 "interactive" => options.interactive = true,
                 "quiet" => {}
-                "exclude" => options
-                    .excludes
-                    .push(inline.or_else(|| iter.next().cloned())?),
-                _ => return None,
-            }
-            continue;
-        }
-        let mut chars = arg.chars().skip(1).peekable();
-        while let Some(flag) = chars.next() {
-            match flag {
-                'f' => options.force = true,
-                'n' => options.dry_run = true,
-                'i' => options.interactive = true,
-                'q' => {}
-                'd' => options.directories = true,
-                'x' => options.ignore = IgnoreMode::AlsoIgnored,
-                'X' => options.ignore = IgnoreMode::OnlyIgnored,
-                'e' => {
-                    let rest: String = chars.by_ref().collect();
-                    options.excludes.push(if rest.is_empty() {
-                        iter.next().cloned()?
-                    } else {
-                        rest
-                    });
+                "exclude" => {
+                    let val = inline_value.or_else(|| scanner.next_raw_arg())?;
+                    options.excludes.push(val.to_string());
                 }
                 _ => return None,
+            },
+            super::args::ArgToken::Short(mut cluster) => {
+                while let Some(flag) = cluster.next_flag() {
+                    match flag {
+                        'f' => options.force = true,
+                        'n' => options.dry_run = true,
+                        'i' => options.interactive = true,
+                        'q' => {}
+                        'd' => options.directories = true,
+                        'x' => options.ignore = IgnoreMode::AlsoIgnored,
+                        'X' => options.ignore = IgnoreMode::OnlyIgnored,
+                        'e' => {
+                            let val = cluster.take_value(&mut scanner)?;
+                            options.excludes.push(val.to_string());
+                        }
+                        _ => return None,
+                    }
+                }
             }
         }
     }
@@ -674,7 +917,7 @@ struct BranchSnapshot {
     commit: String,
 }
 
-fn branch(journal: &mut Journal, _paths: &Paths, config: &Config, argv: &[String]) -> Result<i32> {
+fn branch(journal: &mut Journal, paths: &Paths, config: &Config, argv: &[String]) -> Result<i32> {
     let Some(names) = parse_branch_delete(&argv[1..]) else {
         return run_passthrough("git", argv);
     };
@@ -700,6 +943,7 @@ fn branch(journal: &mut Journal, _paths: &Paths, config: &Config, argv: &[String
         return run_passthrough("git", argv);
     }
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
     let entry_id = journal.begin_entry("git_branch_delete", argv, &repo.cwd)?;
     let mut pinned_refs = Vec::with_capacity(snapshots.len());
     let mut branches = Vec::with_capacity(snapshots.len());
@@ -778,37 +1022,34 @@ fn parse_branch_delete(args: &[String]) -> Option<Vec<String>> {
     let mut delete = false;
     let mut remotes = false;
     let mut names = Vec::new();
-    let mut only_names = false;
-    for arg in args {
-        if only_names {
-            names.push(arg.clone());
-            continue;
-        }
-        if arg == "--" {
-            only_names = true;
-            continue;
-        }
-        if !arg.starts_with('-') {
-            names.push(arg.clone());
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            match long {
-                "delete" => delete = true,
-                "remotes" => remotes = true,
-                "force" => {}
-                // Listing, moving, copying, tracking, and interactive modes
-                // are not modeled.
-                _ => return None,
+    let mut scanner = super::args::ArgScanner::new(args);
+    while let Some(token) = scanner.next_token() {
+        match token {
+            super::args::ArgToken::Operand(op) => {
+                names.push(op.to_string());
             }
-            continue;
-        }
-        for flag in arg.chars().skip(1) {
-            match flag {
-                'd' | 'D' => delete = true,
-                'r' => remotes = true,
-                'f' => {}
-                _ => return None,
+            super::args::ArgToken::Long {
+                name,
+                inline_value: _,
+            } => {
+                match name {
+                    "delete" => delete = true,
+                    "remotes" => remotes = true,
+                    "force" => {}
+                    // Listing, moving, copying, tracking, and interactive modes
+                    // are not modeled.
+                    _ => return None,
+                }
+            }
+            super::args::ArgToken::Short(mut cluster) => {
+                while let Some(flag) = cluster.next_flag() {
+                    match flag {
+                        'd' | 'D' => delete = true,
+                        'r' => remotes = true,
+                        'f' => {}
+                        _ => return None,
+                    }
+                }
             }
         }
     }
@@ -1055,52 +1296,39 @@ fn parse_restore(args: &[String]) -> Option<RestoreOptions> {
         source: None,
         pathspecs: Vec::new(),
     };
-    let mut iter = args.iter();
-    let mut only_paths = false;
-    while let Some(arg) = iter.next() {
-        if only_paths {
-            options.pathspecs.push(arg.clone());
-            continue;
-        }
-        if arg == "--" {
-            only_paths = true;
-            continue;
-        }
-        if !arg.starts_with('-') {
-            options.pathspecs.push(arg.clone());
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, inline) = match long.split_once('=') {
-                Some((name, value)) => (name, Some(value.to_string())),
-                None => (long, None),
-            };
-            match name {
-                "staged" => options.staged = true,
-                "worktree" => options.worktree = true,
-                "source" => options.source = Some(inline.or_else(|| iter.next().cloned())?),
-                "quiet" | "progress" | "no-progress" | "ignore-unmerged" | "overlay"
-                | "no-overlay" => {}
-                // Interactive or conflict-side restoration is not modeled.
-                _ => return None,
+    let mut scanner = super::args::ArgScanner::new(args);
+    while let Some(token) = scanner.next_token() {
+        match token {
+            super::args::ArgToken::Operand(op) => {
+                options.pathspecs.push(op.to_string());
             }
-            continue;
-        }
-        let mut chars = arg.chars().skip(1).peekable();
-        while let Some(flag) = chars.next() {
-            match flag {
-                'S' => options.staged = true,
-                'W' => options.worktree = true,
-                'q' => {}
-                's' => {
-                    let rest: String = chars.by_ref().collect();
-                    options.source = Some(if rest.is_empty() {
-                        iter.next().cloned()?
-                    } else {
-                        rest
-                    });
+            super::args::ArgToken::Long { name, inline_value } => {
+                match name {
+                    "staged" => options.staged = true,
+                    "worktree" => options.worktree = true,
+                    "source" => {
+                        let val = inline_value.or_else(|| scanner.next_raw_arg())?;
+                        options.source = Some(val.to_string());
+                    }
+                    "quiet" | "progress" | "no-progress" | "ignore-unmerged" | "overlay"
+                    | "no-overlay" => {}
+                    // Interactive or conflict-side restoration is not modeled.
+                    _ => return None,
                 }
-                _ => return None,
+            }
+            super::args::ArgToken::Short(mut cluster) => {
+                while let Some(flag) = cluster.next_flag() {
+                    match flag {
+                        'S' => options.staged = true,
+                        'W' => options.worktree = true,
+                        'q' => {}
+                        's' => {
+                            let val = cluster.take_value(&mut scanner)?;
+                            options.source = Some(val.to_string());
+                        }
+                        _ => return None,
+                    }
+                }
             }
         }
     }
@@ -1140,6 +1368,7 @@ fn snapshot_paths_command(
         None
     };
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
     let entry_id = journal.begin_entry(command, argv, &repo.cwd)?;
     let stager = Stager::new(paths, entry_id);
     let mut staged_rows: Vec<(i64, PathBuf, bool)> = Vec::new();
@@ -1243,6 +1472,399 @@ fn list_tree_matching(repo: &Repo, treeish: &str, pathspecs: &[String]) -> Resul
     args.extend(pathspecs.iter().cloned());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     repo.z_paths(&refs)
+}
+
+// ---------------------------------------------------------------------------
+// git commit --amend
+// ---------------------------------------------------------------------------
+
+fn commit(journal: &mut Journal, paths: &Paths, config: &Config, argv: &[String]) -> Result<i32> {
+    let amend = argv
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "--amend" || arg.starts_with("--amend="));
+    if !amend {
+        return run_passthrough("git", argv);
+    }
+    let Some(repo) = Repo::discover() else {
+        return run_passthrough("git", argv);
+    };
+
+    let head = match repo.text(&["rev-parse", "--verify", "--quiet", "HEAD"])? {
+        Some(head) => head,
+        None => return run_passthrough("git", argv),
+    };
+    let branch = repo.text(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let index_tree = repo.text(&["write-tree"])?;
+    let stash = repo.text(&["stash", "create"])?;
+
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
+    let entry_id = journal.begin_entry("git_commit_amend", argv, &repo.cwd)?;
+    let mut refs: Vec<String> = Vec::new();
+    if let Err(err) = pin_ref(&repo, entry_id, "head", &head) {
+        warn(&format!(
+            "could not pin HEAD snapshot before commit --amend: {err}"
+        ));
+    } else {
+        refs.push(ref_name(entry_id, "head"));
+    }
+    if let Some(tree) = &index_tree {
+        if pin_ref(&repo, entry_id, "index", tree).is_ok() {
+            refs.push(ref_name(entry_id, "index"));
+        }
+    }
+    if let Some(stash_commit) = &stash {
+        if pin_ref(&repo, entry_id, "stash", stash_commit).is_ok() {
+            refs.push(ref_name(entry_id, "stash"));
+        }
+    }
+
+    let exit_code = run_passthrough("git", argv)?;
+    if exit_code != 0 {
+        for reference in &refs {
+            let _ = delete_ref(&repo.root, reference);
+        }
+        journal.delete_entry(entry_id)?;
+        return Ok(exit_code);
+    }
+
+    let meta = json!({
+        "repo": repo.root.display().to_string(),
+        "git_dir": repo.git_dir.display().to_string(),
+        "head": head,
+        "branch": branch,
+        "index_tree": index_tree,
+        "stash": stash,
+        "refs": refs,
+        "keep_refs": config.git.keep_refs,
+    });
+    journal.finish_entry(
+        entry_id,
+        EntryStatus::Done,
+        Some(exit_code),
+        true,
+        Some(&meta),
+    )?;
+    Ok(exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// git stash drop / clear / pop
+// ---------------------------------------------------------------------------
+
+fn stash(journal: &mut Journal, paths: &Paths, config: &Config, argv: &[String]) -> Result<i32> {
+    let Some(sub) = argv.get(1).map(String::as_str) else {
+        return run_passthrough("git", argv);
+    };
+
+    match sub {
+        "clear" => {
+            let Some(repo) = Repo::discover() else {
+                return run_passthrough("git", argv);
+            };
+            let stashes = read_stash_stack(&repo)?;
+            if stashes.is_empty() {
+                return run_passthrough("git", argv);
+            }
+
+            let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
+            let entry_id = journal.begin_entry("git_stash", argv, &repo.cwd)?;
+            let mut refs = Vec::new();
+            let mut recorded_stashes = Vec::new();
+            for (i, (commit, msg)) in stashes.iter().enumerate() {
+                let reference = ref_name(entry_id, &format!("stash-{i}"));
+                if pin_ref(&repo, entry_id, &format!("stash-{i}"), commit).is_ok() {
+                    refs.push(reference.clone());
+                    recorded_stashes.push(json!({
+                        "commit": commit,
+                        "message": msg,
+                        "ref": reference,
+                    }));
+                }
+            }
+
+            let exit_code = run_passthrough("git", argv)?;
+            if exit_code != 0 {
+                for r in &refs {
+                    let _ = delete_ref(&repo.root, r);
+                }
+                journal.delete_entry(entry_id)?;
+                return Ok(exit_code);
+            }
+
+            let meta = json!({
+                "repo": repo.root.display().to_string(),
+                "git_dir": repo.git_dir.display().to_string(),
+                "role": "stash_clear",
+                "pre_stack": recorded_stashes,
+                "refs": refs,
+                "keep_refs": config.git.keep_refs,
+            });
+            journal.finish_entry(
+                entry_id,
+                EntryStatus::Done,
+                Some(exit_code),
+                true,
+                Some(&meta),
+            )?;
+            Ok(exit_code)
+        }
+        "drop" => {
+            let Some(repo) = Repo::discover() else {
+                return run_passthrough("git", argv);
+            };
+            let stashes = read_stash_stack(&repo)?;
+            if stashes.is_empty() {
+                return run_passthrough("git", argv);
+            }
+
+            let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
+            let entry_id = journal.begin_entry("git_stash", argv, &repo.cwd)?;
+            let mut refs = Vec::new();
+            let mut recorded_stashes = Vec::new();
+            for (i, (commit, msg)) in stashes.iter().enumerate() {
+                let reference = ref_name(entry_id, &format!("stash-{i}"));
+                if pin_ref(&repo, entry_id, &format!("stash-{i}"), commit).is_ok() {
+                    refs.push(reference.clone());
+                    recorded_stashes.push(json!({
+                        "commit": commit,
+                        "message": msg,
+                        "ref": reference,
+                    }));
+                }
+            }
+
+            let exit_code = run_passthrough("git", argv)?;
+            if exit_code != 0 {
+                for r in &refs {
+                    let _ = delete_ref(&repo.root, r);
+                }
+                journal.delete_entry(entry_id)?;
+                return Ok(exit_code);
+            }
+
+            let meta = json!({
+                "repo": repo.root.display().to_string(),
+                "git_dir": repo.git_dir.display().to_string(),
+                "role": "stash_drop",
+                "pre_stack": recorded_stashes,
+                "refs": refs,
+                "keep_refs": config.git.keep_refs,
+            });
+            journal.finish_entry(
+                entry_id,
+                EntryStatus::Done,
+                Some(exit_code),
+                true,
+                Some(&meta),
+            )?;
+            Ok(exit_code)
+        }
+        "pop" => {
+            let Some(repo) = Repo::discover() else {
+                return run_passthrough("git", argv);
+            };
+            let stashes = read_stash_stack(&repo)?;
+            if stashes.is_empty() {
+                return run_passthrough("git", argv);
+            }
+
+            let mut target = "refs/stash".to_string();
+            for arg in &argv[2..] {
+                if !arg.starts_with('-') {
+                    if arg.chars().all(|c| c.is_ascii_digit()) {
+                        target = format!("stash@{{{arg}}}");
+                    } else {
+                        target = arg.clone();
+                    }
+                    break;
+                }
+            }
+            let popped_commit = match repo.text(&["rev-parse", "--verify", "--quiet", &target])? {
+                Some(c) => c,
+                None => return run_passthrough("git", argv),
+            };
+
+            let mut untracked_files = Vec::new();
+            if repo
+                .text(&[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{popped_commit}^3"),
+                ])?
+                .is_some()
+            {
+                if let Ok(paths) = repo.z_paths(&[
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    "--name-only",
+                    &format!("{popped_commit}^3"),
+                ]) {
+                    untracked_files = paths;
+                }
+            }
+
+            let head = match repo.text(&["rev-parse", "--verify", "--quiet", "HEAD"])? {
+                Some(head) => head,
+                None => return run_passthrough("git", argv),
+            };
+            let branch = repo.text(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+            let index_tree = repo.text(&["write-tree"])?;
+            let stash_state = repo.text(&["stash", "create"])?;
+
+            let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
+            let entry_id = journal.begin_entry("git_stash", argv, &repo.cwd)?;
+            let mut refs = Vec::new();
+            let mut recorded_stashes = Vec::new();
+            for (i, (commit, msg)) in stashes.iter().enumerate() {
+                let reference = ref_name(entry_id, &format!("stash-{i}"));
+                if pin_ref(&repo, entry_id, &format!("stash-{i}"), commit).is_ok() {
+                    refs.push(reference.clone());
+                    recorded_stashes.push(json!({
+                        "commit": commit,
+                        "message": msg,
+                        "ref": reference,
+                    }));
+                }
+            }
+            if let Err(err) = pin_ref(&repo, entry_id, "head", &head) {
+                warn(&format!(
+                    "could not pin HEAD snapshot before stash pop: {err}"
+                ));
+            } else {
+                refs.push(ref_name(entry_id, "head"));
+            }
+            if let Some(tree) = &index_tree {
+                if pin_ref(&repo, entry_id, "index", tree).is_ok() {
+                    refs.push(ref_name(entry_id, "index"));
+                }
+            }
+            if let Some(state) = &stash_state {
+                if pin_ref(&repo, entry_id, "stash_state", state).is_ok() {
+                    refs.push(ref_name(entry_id, "stash_state"));
+                }
+            }
+
+            let exit_code = run_passthrough("git", argv)?;
+            // If pop fails (e.g. conflicts), git keeps the stash in refs/stash.
+            // Do NOT record an undo entry for a failed/conflicted pop.
+            if exit_code != 0 {
+                for r in &refs {
+                    let _ = delete_ref(&repo.root, r);
+                }
+                journal.delete_entry(entry_id)?;
+                return Ok(exit_code);
+            }
+
+            let meta = json!({
+                "repo": repo.root.display().to_string(),
+                "git_dir": repo.git_dir.display().to_string(),
+                "role": "stash_pop",
+                "head": head,
+                "branch": branch,
+                "index_tree": index_tree,
+                "stash_state": stash_state,
+                "untracked_files": untracked_files,
+                "pre_stack": recorded_stashes,
+                "refs": refs,
+                "keep_refs": config.git.keep_refs,
+            });
+            journal.finish_entry(
+                entry_id,
+                EntryStatus::Done,
+                Some(exit_code),
+                true,
+                Some(&meta),
+            )?;
+            Ok(exit_code)
+        }
+        _ => run_passthrough("git", argv),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git rebase
+// ---------------------------------------------------------------------------
+
+fn rebase(journal: &mut Journal, paths: &Paths, config: &Config, argv: &[String]) -> Result<i32> {
+    if argv.iter().skip(1).any(|arg| {
+        arg == "--abort" || arg == "--continue" || arg == "--skip" || arg == "--edit-todo"
+    }) {
+        return run_passthrough("git", argv);
+    }
+    let Some(repo) = Repo::discover() else {
+        return run_passthrough("git", argv);
+    };
+
+    let head = match repo.text(&["rev-parse", "--verify", "--quiet", "HEAD"])? {
+        Some(head) => head,
+        None => return run_passthrough("git", argv),
+    };
+    let branch = repo.text(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let index_tree = repo.text(&["write-tree"])?;
+    let stash = repo.text(&["stash", "create"])?;
+
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
+    let entry_id = journal.begin_entry("git_rebase", argv, &repo.cwd)?;
+    let mut refs: Vec<String> = Vec::new();
+    if let Err(err) = pin_ref(&repo, entry_id, "head", &head) {
+        warn(&format!("could not pin HEAD snapshot before rebase: {err}"));
+    } else {
+        refs.push(ref_name(entry_id, "head"));
+    }
+    if let Some(tree) = &index_tree {
+        if pin_ref(&repo, entry_id, "index", tree).is_ok() {
+            refs.push(ref_name(entry_id, "index"));
+        }
+    }
+    if let Some(stash_commit) = &stash {
+        if pin_ref(&repo, entry_id, "stash", stash_commit).is_ok() {
+            refs.push(ref_name(entry_id, "stash"));
+        }
+    }
+
+    let exit_code = run_passthrough("git", argv)?;
+    let in_progress =
+        repo.git_dir.join("rebase-merge").exists() || repo.git_dir.join("rebase-apply").exists();
+    let current_head = repo.text(&["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    let modified = in_progress || (current_head.as_deref() != Some(&head));
+
+    if exit_code != 0 && !in_progress && !modified {
+        for reference in &refs {
+            let _ = delete_ref(&repo.root, reference);
+        }
+        journal.delete_entry(entry_id)?;
+        return Ok(exit_code);
+    }
+
+    let meta = json!({
+        "repo": repo.root.display().to_string(),
+        "git_dir": repo.git_dir.display().to_string(),
+        "head": head,
+        "branch": branch,
+        "index_tree": index_tree,
+        "stash": stash,
+        "refs": refs,
+        "keep_refs": config.git.keep_refs,
+    });
+    journal.finish_entry(
+        entry_id,
+        EntryStatus::Done,
+        Some(exit_code),
+        true,
+        Some(&meta),
+    )?;
+    Ok(exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// git merge
+// ---------------------------------------------------------------------------
+
+fn merge(_journal: &mut Journal, _paths: &Paths, _config: &Config, argv: &[String]) -> Result<i32> {
+    run_passthrough("git", argv)
 }
 
 #[cfg(test)]

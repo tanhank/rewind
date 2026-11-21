@@ -75,6 +75,50 @@ fn partial_failure_still_undoes_what_was_removed() {
 }
 
 #[test]
+fn rm_directory_with_external_symlink_does_not_delete_target() {
+    let sandbox = Sandbox::new();
+    let outside = sandbox.home.join("outside_target");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "untouchable").unwrap();
+
+    sandbox.write("work_dir/dummy.txt", "hello");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, sandbox.path("work_dir/ext_link")).unwrap();
+
+    sandbox.exec_ok("rm", &["-rf", "work_dir"]);
+    assert!(!sandbox.exists("work_dir"));
+    assert!(outside.join("secret.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "untouchable"
+    );
+
+    sandbox.run_ok(&["undo"]);
+    assert!(sandbox.exists("work_dir/dummy.txt"));
+    #[cfg(unix)]
+    {
+        let link = sandbox.path("work_dir/ext_link");
+        assert!(is_symlink(&link));
+    }
+}
+
+#[test]
+fn rm_dangling_symlink_then_undo() {
+    let sandbox = Sandbox::new();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(sandbox.path("nowhere"), sandbox.path("broken_link")).unwrap();
+        assert!(is_symlink(&sandbox.path("broken_link")));
+
+        sandbox.exec_ok("rm", &["broken_link"]);
+        assert!(!sandbox.path("broken_link").exists() && !is_symlink(&sandbox.path("broken_link")));
+
+        sandbox.run_ok(&["undo"]);
+        assert!(is_symlink(&sandbox.path("broken_link")));
+    }
+}
+
+#[test]
 fn missing_operand_matches_coreutils_message_and_exit_code() {
     let sandbox = Sandbox::new();
     let output = sandbox.run_fail(&["exec", "rm", "--", "nope.txt"]);

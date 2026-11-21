@@ -268,8 +268,19 @@ fn compare_with_real_rm(sandbox: &Sandbox, args: &[&str], fixture: &[&str]) {
     );
 }
 
+fn is_gnu_rm() -> bool {
+    Command::new("rm")
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU coreutils"))
+        .unwrap_or(false)
+}
+
 #[test]
 fn rm_output_and_exit_codes_match_gnu_coreutils() {
+    if !is_gnu_rm() {
+        return;
+    }
     let sandbox = Sandbox::new();
     compare_with_real_rm(&sandbox, &["-f", "missing"], &[]);
     compare_with_real_rm(&sandbox, &["missing"], &[]);

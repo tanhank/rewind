@@ -41,6 +41,20 @@ pub enum Error {
     Refused(String),
 }
 
+impl Error {
+    /// Return the standard Unix process exit code for this error category:
+    /// - `2`: Invalid user input, argument syntax, or unparseable duration/option.
+    /// - `3`: Refused operation (e.g. storage capacity cap exceeded, or destination conflict during undo).
+    /// - `1`: General I/O, database, staging, or runtime failure.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Error::InvalidInput(_) => 2,
+            Error::Refused(_) => 3,
+            _ => 1,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Attach a path to an [`std::io::Error`].

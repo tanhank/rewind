@@ -322,3 +322,124 @@ fn inspect_summarizes_git_branch_delete_and_detects_conflicts() {
     assert_eq!(json["recovery"]["state"], "conflict");
     assert!(!json["recovery"]["conflicts"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn undo_by_explicit_id_and_dry_run() {
+    let sandbox = Sandbox::new();
+    sandbox.write("first.txt", "one");
+    sandbox.write("second.txt", "two");
+
+    sandbox.exec_ok("rm", &["first.txt"]);
+    sandbox.exec_ok("rm", &["second.txt"]);
+
+    // Dry-run specific entry #1
+    let dry = sandbox.run_ok(&["undo", "--id", "1", "--dry-run"]);
+    let dry_text = stdout_of(&dry);
+    assert!(dry_text.contains("would undo #1"));
+    assert!(dry_text.contains("rm first.txt"));
+    assert!(!sandbox.exists("first.txt"));
+
+    // Undo specific entry #1 directly (not newest #2)
+    let output = sandbox.run_ok(&["undo", "--id", "1"]);
+    assert!(stdout_of(&output).contains("rewind: undone #1"));
+    assert!(sandbox.exists("first.txt"));
+    assert!(!sandbox.exists("second.txt"));
+
+    // Undoing #1 again fails because it is already undone (refused)
+    let re_undo = sandbox.run_fail(&["undo", "--id", "1"]);
+    assert_eq!(re_undo.status.code(), Some(3));
+    assert!(stderr_of(&re_undo).contains("entry #1 cannot be undone"));
+
+    // Non-existent ID returns invalid input (code 2)
+    let missing = sandbox.run_fail(&["undo", "--id", "999"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(stderr_of(&missing).contains("no journal entry #999"));
+
+    // Undo remaining #2
+    sandbox.run_ok(&["undo", "--id", "2"]);
+    assert!(sandbox.exists("second.txt"));
+}
+
+#[test]
+fn log_filtering_by_cmd_undoable_and_status() {
+    let sandbox = Sandbox::new();
+    sandbox.write("file1.txt", "1");
+    sandbox.write("file2.txt", "2");
+
+    sandbox.exec_ok("rm", &["file1.txt"]);
+    sandbox.exec_ok("rm", &["file2.txt"]);
+    sandbox.run_ok(&["undo", "--id", "1"]);
+
+    // Filter by command
+    let log_rm = sandbox.run_ok(&["log", "--cmd", "rm", "--json"]);
+    let json_rm: serde_json::Value = serde_json::from_slice(&log_rm.stdout).unwrap();
+    let arr = json_rm.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+
+    // Filter by non-existent command
+    let log_other = sandbox.run_ok(&["log", "--cmd", "git", "--json"]);
+    let json_other: serde_json::Value = serde_json::from_slice(&log_other.stdout).unwrap();
+    assert!(json_other.as_array().unwrap().is_empty());
+
+    // Filter by undoable only: #1 is undone, so only #2 should appear
+    let log_undoable = sandbox.run_ok(&["log", "--undoable", "--json"]);
+    let json_undoable: serde_json::Value = serde_json::from_slice(&log_undoable.stdout).unwrap();
+    let undoable_arr = json_undoable.as_array().unwrap();
+    assert_eq!(undoable_arr.len(), 1);
+    assert_eq!(undoable_arr[0]["id"], 2);
+
+    // Filter by status undone: only #1 should appear
+    let log_undone = sandbox.run_ok(&["log", "--status", "undone", "--json"]);
+    let json_undone: serde_json::Value = serde_json::from_slice(&log_undone.stdout).unwrap();
+    let undone_arr = json_undone.as_array().unwrap();
+    assert_eq!(undone_arr.len(), 1);
+    assert_eq!(undone_arr[0]["id"], 1);
+}
+
+#[test]
+fn clean_emits_valid_json_and_dry_run_json() {
+    let sandbox = Sandbox::new();
+    sandbox.write("to_delete.txt", "temporary data");
+    sandbox.exec_ok("rm", &["to_delete.txt"]);
+
+    // Dry-run clean with JSON
+    let dry_json_out = sandbox.run_ok(&["clean", "--all", "--dry-run", "--json"]);
+    let dry_val: serde_json::Value = serde_json::from_slice(&dry_json_out.stdout).unwrap();
+    assert_eq!(dry_val["dry_run"], true);
+    assert_eq!(dry_val["entries"], 1);
+    assert!(dry_val["bytes"].as_u64().unwrap() > 0);
+
+    // Real clean with JSON
+    let real_json_out = sandbox.run_ok(&["clean", "--all", "--json"]);
+    let real_val: serde_json::Value = serde_json::from_slice(&real_json_out.stdout).unwrap();
+    assert_eq!(real_val["dry_run"], false);
+    assert_eq!(real_val["entries"], 1);
+    assert!(real_val["bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn config_list_prints_known_keys_and_values() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_ok(&["config", "list"]);
+    let text = stdout_of(&output);
+    assert!(text.contains("wrap.rm = true"));
+    assert!(text.contains("trash.retention_days = 30"));
+    assert!(text.contains("trash.max_bytes = 10737418240"));
+    assert!(text.contains("git.snapshot_untracked = true"));
+}
+
+#[test]
+fn exit_codes_distinguish_input_errors_and_refusals() {
+    let sandbox = Sandbox::new();
+    sandbox.write("collision.txt", "original");
+    sandbox.exec_ok("rm", &["collision.txt"]);
+
+    // Invalid input syntax returns code 2
+    let invalid = sandbox.run_fail(&["clean", "--older-than", "invalid-duration"]);
+    assert_eq!(invalid.status.code(), Some(2));
+
+    // Recreate file to trigger collision during undo (refusal -> code 3)
+    sandbox.write("collision.txt", "recreated collision");
+    let collision = sandbox.run_fail(&["undo", "--id", "1"]);
+    assert_eq!(collision.status.code(), Some(1)); // undo failure code
+}

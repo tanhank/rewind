@@ -42,19 +42,35 @@ jobs:
         run: cargo build --release --locked
 
   macos:
-    name: compile (macOS)
-    runs-on: macos-15-intel
+    name: build, lint, and test (macOS - ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
-      # macOS is a secondary target. Compile every target (including the
-      # integration suite) so portability regressions surface early, but run
-      # the full suite only on Linux.
-      - name: Check
-        run: cargo check --all-targets --locked
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked

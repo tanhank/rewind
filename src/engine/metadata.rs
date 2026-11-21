@@ -54,13 +54,23 @@ pub enum Collected<T> {
 
 /// Returns true when a short-option cluster asks for recursion.
 pub fn wants_recursive(argv: &[String]) -> bool {
-    argv.iter().any(|arg| {
-        arg == "--recursive"
-            || (arg.starts_with('-')
-                && !arg.starts_with("--")
-                && arg.len() > 1
-                && arg.chars().skip(1).any(|c| c == 'R'))
-    })
+    let mut scanner = super::args::ArgScanner::new(argv);
+    while let Some(token) = scanner.next_token() {
+        match token {
+            super::args::ArgToken::Long {
+                name: "recursive", ..
+            } => return true,
+            super::args::ArgToken::Short(mut cluster) => {
+                while let Some(flag) = cluster.next_flag() {
+                    if flag == 'R' {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Every operand that names an existing path. This deliberately ignores mode
@@ -68,22 +78,25 @@ pub fn wants_recursive(argv: &[String]) -> bool {
 /// simpler and more robust than reimplementing chmod/chown grammars.
 pub fn existing_operands(argv: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut only_paths = false;
-    for arg in argv {
-        if arg == "--" {
-            only_paths = true;
-            continue;
-        }
-        if !only_paths && arg.starts_with('-') && arg.len() > 1 {
-            // `--reference=FILE` names a path inside the option value; the
-            // referenced file itself is not modified.
-            continue;
-        }
-        let candidate = Path::new(arg);
-        if candidate.symlink_metadata().is_ok() {
-            if let Ok(absolute) = absolutize(candidate) {
-                out.push(absolute);
+    let mut scanner = super::args::ArgScanner::new(argv);
+    while let Some(token) = scanner.next_token() {
+        match token {
+            super::args::ArgToken::Operand(arg) => {
+                let candidate = Path::new(arg);
+                if candidate.symlink_metadata().is_ok() {
+                    if let Ok(absolute) = absolutize(candidate) {
+                        out.push(absolute);
+                    }
+                }
             }
+            super::args::ArgToken::Long { name, inline_value } => {
+                // `--reference=FILE` names a path inside the option value; the
+                // referenced file itself is not modified.
+                if name == "reference" && inline_value.is_none() {
+                    let _ = scanner.next_raw_arg();
+                }
+            }
+            super::args::ArgToken::Short(_) => {}
         }
     }
     // Deduplicate while preserving order.

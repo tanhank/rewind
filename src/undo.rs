@@ -23,6 +23,15 @@ pub struct UndoReport {
     pub items: usize,
 }
 
+/// Target specification for an undo run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoTarget {
+    /// Undo the last `n` entries (newest first).
+    Last(usize),
+    /// Undo a specific entry by its journal ID.
+    Entry(i64),
+}
+
 /// Undo the last `count` journal entries (newest first).
 pub fn run(
     journal: &mut Journal,
@@ -30,15 +39,42 @@ pub fn run(
     count: usize,
     dry_run: bool,
 ) -> crate::error::Result<UndoReport> {
-    if count == 0 {
-        return Err(crate::error::Error::InvalidInput(
-            "n must be at least 1".into(),
-        ));
-    }
+    run_target(journal, paths, UndoTarget::Last(count), dry_run)
+}
+
+/// Execute an undo operation targeting either the last N entries or a specific entry ID.
+pub fn run_target(
+    journal: &mut Journal,
+    paths: &Paths,
+    target: UndoTarget,
+    dry_run: bool,
+) -> crate::error::Result<UndoReport> {
     // Anything left "running" for a day was interrupted (SIGKILL, crash).
     let _ = journal.mark_stale_running(86_400);
 
-    let entries = journal.undoable_entries(count)?;
+    let entries = match target {
+        UndoTarget::Last(count) => {
+            if count == 0 {
+                return Err(crate::error::Error::InvalidInput(
+                    "n must be at least 1".into(),
+                ));
+            }
+            journal.undoable_entries(count)?
+        }
+        UndoTarget::Entry(id) => {
+            let entry = journal.entry(id)?.ok_or_else(|| {
+                crate::error::Error::InvalidInput(format!("no journal entry #{id}"))
+            })?;
+            if !entry.is_undoable() {
+                return Err(crate::error::Error::Refused(format!(
+                    "entry #{id} cannot be undone (status is '{}')",
+                    entry.status.as_str()
+                )));
+            }
+            vec![entry]
+        }
+    };
+
     let mut report = UndoReport::default();
     if entries.is_empty() {
         println!("rewind: nothing to undo");
@@ -99,8 +135,18 @@ fn undo_entry(journal: &mut Journal, paths: &Paths, entry: &Entry) -> crate::err
         return Ok(complete);
     }
 
-    if entry.command == "git_reset" {
+    if entry.command == "git_reset"
+        || entry.command == "git_commit_amend"
+        || entry.command == "git_rebase"
+    {
         git::undo_reset(entry)?;
+        journal.mark_undone(entry.id)?;
+        let _ = stager.cleanup_entry_dir();
+        return Ok(true);
+    }
+
+    if entry.command == "git_stash" {
+        git::undo_stash(entry)?;
         journal.mark_undone(entry.id)?;
         let _ = stager.cleanup_entry_dir();
         return Ok(true);

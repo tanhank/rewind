@@ -43,8 +43,18 @@ CREATE TABLE IF NOT EXISTS staged (
     meta     TEXT    NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS reservations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id    INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    pid         INTEGER NOT NULL,
+    start_time  INTEGER NOT NULL DEFAULT 0,
+    bytes       INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_staged_entry ON staged(entry_id);
 CREATE INDEX IF NOT EXISTS idx_entries_status ON entries(status, id);
+CREATE INDEX IF NOT EXISTS idx_reservations_entry ON reservations(entry_id);
 PRAGMA user_version = 1;
 "#;
 
@@ -214,6 +224,26 @@ impl NewStaged {
     }
 }
 
+/// Options for filtering journal history queries.
+#[derive(Debug, Default, Clone)]
+pub struct LogFilter {
+    pub limit: usize,
+    pub command: Option<String>,
+    pub undoable_only: bool,
+    pub status: Option<String>,
+}
+
+/// Result of a SQLite WAL checkpoint operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpointResult {
+    /// True if the checkpoint was blocked by an active reader or writer.
+    pub busy: bool,
+    /// Total number of pages in the WAL file before checkpointing.
+    pub log_pages: i32,
+    /// Number of pages successfully checkpointed to the database.
+    pub checkpointed_pages: i32,
+}
+
 /// Aggregate counts for `rewind status`.
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
@@ -241,6 +271,26 @@ impl Journal {
             .map_err(|err| Error::Journal(format!("opening {}: {err}", path.display())))?;
         conn.execute_batch(SCHEMA)
             .map_err(|err| Error::Journal(format!("initializing schema: {err}")))?;
+        let _ = conn.execute(
+            "ALTER TABLE reservations ADD COLUMN start_time INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let priv_perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(path, priv_perms.clone());
+            let wal = path.with_extension("db-wal");
+            if wal.exists() {
+                let _ = std::fs::set_permissions(&wal, priv_perms.clone());
+            }
+            let shm = path.with_extension("db-shm");
+            if shm.exists() {
+                let _ = std::fs::set_permissions(&shm, priv_perms);
+            }
+        }
+
         Ok(Self { conn })
     }
 
@@ -250,7 +300,21 @@ impl Journal {
             .map_err(|err| Error::Journal(format!("open memory: {err}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|err| Error::Journal(format!("initializing schema: {err}")))?;
+        let _ = conn.execute(
+            "ALTER TABLE reservations ADD COLUMN start_time INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self { conn })
+    }
+
+    /// Access the underlying SQLite connection.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Access the underlying SQLite connection mutably.
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 
     /// Open an existing journal without the ability to change entries.
@@ -276,7 +340,8 @@ impl Journal {
 
     /// Record the start of an intercepted command and return its entry id.
     pub fn begin_entry(&mut self, command: &str, argv: &[String], cwd: &Path) -> Result<i64> {
-        let argv_json = serde_json::to_string(argv)
+        let redacted = crate::redact::redact_argv(argv);
+        let argv_json = serde_json::to_string(&redacted)
             .map_err(|err| Error::Journal(format!("serializing argv: {err}")))?;
         self.conn
             .execute(
@@ -347,6 +412,10 @@ impl Journal {
                 ],
             )
             .map_err(|err| Error::Journal(format!("finishing entry: {err}")))?;
+        let _ = self.conn.execute(
+            "DELETE FROM reservations WHERE entry_id = ?1",
+            params![entry_id],
+        );
         Ok(())
     }
 
@@ -492,6 +561,54 @@ impl Journal {
         Ok(out)
     }
 
+    /// List journal history with flexible command, status, and undoability filters.
+    pub fn list_filtered(&self, filter: &LogFilter) -> Result<Vec<Entry>> {
+        let mut sql = String::from(
+            "SELECT id, created_at, finished_at, command, argv, cwd, status,
+                    exit_code, undoable, meta, purged_at
+               FROM entries
+              WHERE 1=1",
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(cmd) = &filter.command {
+            let cmd_lower = cmd.to_lowercase();
+            sql.push_str(" AND (LOWER(command) = ? OR LOWER(command) LIKE ?)");
+            params.push(rusqlite::types::Value::Text(cmd_lower.clone()));
+            params.push(rusqlite::types::Value::Text(format!("%{cmd_lower}%")));
+        }
+
+        if let Some(st) = &filter.status {
+            sql.push_str(" AND LOWER(status) = ?");
+            params.push(rusqlite::types::Value::Text(st.to_lowercase()));
+        }
+
+        if filter.undoable_only {
+            sql.push_str(" AND undoable = 1 AND status IN ('done', 'interrupted', 'running')");
+        }
+
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        let limit = if filter.limit == 0 { 30 } else { filter.limit };
+        params.push(rusqlite::types::Value::Integer(limit as i64));
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| Error::Journal(format!("preparing filtered log query: {err}")))?;
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), row_to_entry)
+            .map_err(|err| Error::Journal(format!("querying filtered log: {err}")))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| Error::Journal(format!("reading filtered entry: {err}")))?);
+        }
+        Ok(out)
+    }
+
     /// Rows that were never finished (process killed, machine crashed).
     pub fn mark_stale_running(&mut self, older_than_secs: i64) -> Result<usize> {
         let cutoff = now_unix() - older_than_secs;
@@ -507,8 +624,54 @@ impl Journal {
         Ok(changed)
     }
 
+    /// Sanitize historical entries in SQLite by running redaction on their stored argv.
+    /// Returns the number of historical entries updated.
+    pub fn sanitize_historical_entries(&mut self) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, argv FROM entries")
+            .map_err(|err| Error::Journal(format!("preparing sanitize query: {err}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let argv_raw: String = row.get(1)?;
+                Ok((id, argv_raw))
+            })
+            .map_err(|err| Error::Journal(format!("querying entries for sanitization: {err}")))?;
+
+        let mut updates: Vec<(i64, String)> = Vec::new();
+        for item in rows {
+            let (id, argv_raw) =
+                item.map_err(|err| Error::Journal(format!("reading entry: {err}")))?;
+            if let Ok(argv) = serde_json::from_str::<Vec<String>>(&argv_raw) {
+                let sanitized = crate::redact::redact_argv(&argv);
+                if sanitized != argv {
+                    if let Ok(new_json) = serde_json::to_string(&sanitized) {
+                        updates.push((id, new_json));
+                    }
+                }
+            }
+        }
+
+        let count = updates.len();
+        for (id, new_json) in updates {
+            self.conn
+                .execute(
+                    "UPDATE entries SET argv = ?1 WHERE id = ?2",
+                    params![new_json, id],
+                )
+                .map_err(|err| Error::Journal(format!("updating sanitized entry: {err}")))?;
+        }
+
+        Ok(count)
+    }
+
     /// Delete one entry (and its staged rows). Used for no-op commands.
     pub fn delete_entry(&mut self, entry_id: i64) -> Result<()> {
+        let _ = self.conn.execute(
+            "DELETE FROM reservations WHERE entry_id = ?1",
+            params![entry_id],
+        );
         self.conn
             .execute("DELETE FROM entries WHERE id = ?1", params![entry_id])
             .map_err(|err| Error::Journal(format!("deleting entry: {err}")))?;
@@ -690,11 +853,268 @@ impl Journal {
         })
     }
 
+    /// Return the total size in bytes of all currently staged files plus active reservations.
+    pub fn current_staged_bytes(&self) -> Result<u64> {
+        let staged: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(SUM(size), 0) FROM staged", [], |row| {
+                row.get(0)
+            })
+            .map_err(|err| Error::Journal(format!("querying total staged bytes: {err}")))?;
+        let reserved: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(bytes), 0) FROM reservations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| Error::Journal(format!("querying reservations: {err}")))?;
+        Ok((staged.max(0) as u64).saturating_add(reserved.max(0) as u64))
+    }
+
+    /// Check whether staging `incoming_bytes` would exceed `max_bytes` capacity.
+    ///
+    /// If `max_bytes > 0` and current usage + `incoming_bytes` exceeds the cap:
+    /// 1. Attempts to free space by expiring retention-expired entries (older than `retention_days`).
+    /// 2. If capacity is still exceeded, returns `Error::Refused` with an actionable diagnostic.
+    ///
+    /// Valid undoable entries within retention are NEVER automatically purged (SEC-006).
+    pub fn check_capacity(
+        &mut self,
+        incoming_bytes: u64,
+        max_bytes: u64,
+        retention_days: u64,
+    ) -> Result<()> {
+        if max_bytes == 0 {
+            return Ok(());
+        }
+
+        let mut current = self.current_staged_bytes()?;
+        if current.saturating_add(incoming_bytes) <= max_bytes {
+            return Ok(());
+        }
+
+        if retention_days > 0 {
+            let cutoff = now_unix() - (retention_days as i64) * 86_400;
+            let expired_ids = self.expire_staged_before(cutoff)?;
+            if !expired_ids.is_empty() {
+                current = self.current_staged_bytes()?;
+                if current.saturating_add(incoming_bytes) <= max_bytes {
+                    return Ok(());
+                }
+            }
+        }
+
+        let remaining = max_bytes.saturating_sub(current);
+        Err(Error::Refused(format!(
+            "trash storage limit of {} exceeded (currently using {}, staging requires {}, only {} remaining); \
+             run 'rewind clean' or increase trash.max_bytes in config",
+            crate::util::human_size(max_bytes),
+            crate::util::human_size(current),
+            crate::util::human_size(incoming_bytes),
+            crate::util::human_size(remaining)
+        )))
+    }
+
+    /// Atomically check and reserve storage capacity for `entry_id` (SEC-006).
+    ///
+    /// Serializes with concurrent processes via SQLite `BEGIN IMMEDIATE`:
+    /// 1. Sweeps dead PID and stale reservations.
+    /// 2. Computes total staged bytes + active reservations from other entries.
+    /// 3. If exceeding `max_bytes`, attempts to expire retention-expired entries.
+    /// 4. If still exceeding, returns `Error::Refused`.
+    /// 5. Otherwise records a reservation row for `entry_id` with current PID.
+    pub fn reserve_capacity(
+        &mut self,
+        entry_id: i64,
+        incoming_bytes: u64,
+        max_bytes: u64,
+        retention_days: u64,
+    ) -> Result<()> {
+        if max_bytes == 0 {
+            return Ok(());
+        }
+
+        let pid = std::process::id();
+        let now = now_unix();
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| Error::Journal(format!("begin immediate transaction: {err}")))?;
+
+        // 1. Sweep stale or dead PID reservations
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, pid, start_time, created_at FROM reservations")
+                .map_err(|err| Error::Journal(format!("prepare reservations query: {err}")))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, i64>(2)?.max(0) as u64,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|err| Error::Journal(format!("query reservations: {err}")))?;
+
+            let mut stale_ids = Vec::new();
+            for r in rows {
+                let (res_id, res_pid, recorded_st, _created) =
+                    r.map_err(|err| Error::Journal(format!("reading reservation: {err}")))?;
+                let is_dead = {
+                    #[cfg(unix)]
+                    {
+                        let ret = unsafe { libc::kill(res_pid as libc::pid_t, 0) };
+                        if ret == -1 {
+                            std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        } else {
+                            // Process exists. Detect PID reuse by comparing start_time.
+                            if recorded_st > 0 {
+                                if let Some(current_st) =
+                                    crate::util::get_process_start_time(res_pid)
+                                {
+                                    current_st != recorded_st
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = res_pid;
+                        let _ = recorded_st;
+                        false
+                    }
+                };
+                if is_dead {
+                    stale_ids.push(res_id);
+                }
+            }
+            drop(stmt);
+
+            for id in stale_ids {
+                tx.execute("DELETE FROM reservations WHERE id = ?1", params![id])
+                    .map_err(|err| Error::Journal(format!("deleting stale reservation: {err}")))?;
+            }
+        }
+
+        // 2. Query total usage: staged + reservations from other entries
+        let get_usage = |tx: &rusqlite::Transaction| -> Result<u64> {
+            let staged_bytes: i64 = tx
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM staged", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|err| Error::Journal(format!("summing staged bytes: {err}")))?;
+            let reserved_bytes: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(SUM(bytes), 0) FROM reservations WHERE entry_id != ?1",
+                    params![entry_id],
+                    |row| row.get(0),
+                )
+                .map_err(|err| Error::Journal(format!("summing reservations: {err}")))?;
+            Ok((staged_bytes.max(0) as u64).saturating_add(reserved_bytes.max(0) as u64))
+        };
+
+        let mut current = get_usage(&tx)?;
+        if current.saturating_add(incoming_bytes) > max_bytes && retention_days > 0 {
+            let cutoff = now - (retention_days as i64) * 86_400;
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM entries
+                      WHERE created_at <= ?1
+                        AND purged_at IS NULL
+                        AND status IN ('done', 'interrupted', 'failed')
+                      ORDER BY id ASC",
+                )
+                .map_err(|err| Error::Journal(format!("querying expirable entries: {err}")))?;
+            let expirable_ids: Vec<i64> = stmt
+                .query_map(params![cutoff], |row| row.get(0))
+                .map_err(|err| Error::Journal(format!("mapping expirable entries: {err}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+
+            for exp_id in expirable_ids {
+                tx.execute("DELETE FROM staged WHERE entry_id = ?1", params![exp_id])
+                    .map_err(|err| Error::Journal(format!("purging staged rows: {err}")))?;
+                tx.execute(
+                    "UPDATE entries
+                        SET purged_at = ?1, undoable = 0,
+                            status = CASE WHEN status = 'done' THEN 'expired' ELSE status END
+                      WHERE id = ?2",
+                    params![now, exp_id],
+                )
+                .map_err(|err| Error::Journal(format!("marking entry expired: {err}")))?;
+            }
+
+            current = get_usage(&tx)?;
+        }
+
+        if current.saturating_add(incoming_bytes) > max_bytes {
+            let remaining = max_bytes.saturating_sub(current);
+            return Err(Error::Refused(format!(
+                "trash storage limit of {} exceeded (currently using {}, staging requires {}, only {} remaining); \
+                 run 'rewind clean' or increase trash.max_bytes in config",
+                crate::util::human_size(max_bytes),
+                crate::util::human_size(current),
+                crate::util::human_size(incoming_bytes),
+                crate::util::human_size(remaining)
+            )));
+        }
+
+        let start_time = crate::util::get_process_start_time(pid).unwrap_or(0);
+        tx.execute(
+            "INSERT INTO reservations (entry_id, pid, start_time, bytes, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![entry_id, pid, start_time as i64, incoming_bytes as i64, now],
+        )
+        .map_err(|err| Error::Journal(format!("recording capacity reservation: {err}")))?;
+
+        tx.commit()
+            .map_err(|err| Error::Journal(format!("committing capacity reservation: {err}")))?;
+
+        Ok(())
+    }
+
     /// Run `VACUUM` to shrink the journal after garbage collection.
     pub fn vacuum(&self) -> Result<()> {
         self.conn
             .execute_batch("VACUUM;")
             .map_err(|err| Error::Journal(format!("vacuum: {err}")))
+    }
+
+    /// Checkpoint and truncate the SQLite Write-Ahead Log (WAL) to free disk space immediately.
+    /// Returns the exact checkpoint statistics and whether the checkpoint was blocked by busy readers.
+    pub fn wal_checkpoint(&self) -> Result<WalCheckpointResult> {
+        let (busy, log_pages, checkpointed_pages): (i32, i32, i32) = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|err| Error::Journal(format!("wal checkpoint query: {err}")))?;
+
+        Ok(WalCheckpointResult {
+            busy: busy != 0,
+            log_pages,
+            checkpointed_pages,
+        })
+    }
+
+    /// Return the total number of bytes currently reserved by active, in-flight commands.
+    pub fn active_reservations_bytes(&self) -> Result<u64> {
+        let bytes: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(bytes), 0) FROM reservations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| Error::Journal(format!("querying active reservations: {err}")))?;
+        Ok(bytes.max(0) as u64)
     }
 }
 

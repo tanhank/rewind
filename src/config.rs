@@ -40,6 +40,12 @@ pub struct WrapConfig {
     pub git_restore: bool,
     /// Intercept `git branch -d` / `-D`.
     pub git_branch_delete: bool,
+    /// Intercept `git commit --amend`.
+    pub git_commit_amend: bool,
+    /// Intercept `git rebase`.
+    pub git_rebase: bool,
+    /// Intercept `git stash drop`, `clear`, `pop`.
+    pub git_stash: bool,
 }
 
 impl Default for WrapConfig {
@@ -56,9 +62,15 @@ impl Default for WrapConfig {
             git_checkout: true,
             git_restore: true,
             git_branch_delete: true,
+            git_commit_amend: true,
+            git_rebase: true,
+            git_stash: true,
         }
     }
 }
+
+/// Default trash soft storage cap: 10 GiB (SEC-006).
+pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Trash retention policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,18 +78,58 @@ impl Default for WrapConfig {
 pub struct TrashConfig {
     /// Days to keep staged data. `0` disables automatic expiry.
     pub retention_days: u64,
-    /// Soft cap in bytes. `0` means unlimited. `rewind clean` prunes oldest
-    /// entries first when the cap is exceeded.
+    /// Soft cap in bytes. `0` means unlimited.
     pub max_bytes: u64,
+    /// Optional sensitive-file exclusion patterns (e.g. `["*.key", "*.pem", ".env*"]`).
+    /// Operands matching any pattern bypass staging and are deleted directly without undo.
+    pub exclude_patterns: Vec<String>,
 }
 
 impl Default for TrashConfig {
     fn default() -> Self {
         Self {
             retention_days: 30,
-            max_bytes: 0,
+            max_bytes: DEFAULT_MAX_BYTES,
+            exclude_patterns: Vec::new(),
         }
     }
+}
+
+impl TrashConfig {
+    /// Check whether a path matches any sensitive file exclusion pattern.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        if self.exclude_patterns.is_empty() {
+            return false;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let path_str = path.to_string_lossy();
+
+        for pattern in &self.exclude_patterns {
+            if glob_match(pattern, file_name) || glob_match(pattern, &path_str) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        if let Some(suffix) = prefix.strip_prefix('*') {
+            return text.contains(suffix);
+        }
+        return text.starts_with(prefix);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return text.ends_with(suffix);
+    }
+    pattern == text
 }
 
 /// Journal retention.
@@ -165,6 +217,10 @@ impl Config {
             "checkout" => self.wrap.git_checkout,
             "restore" => self.wrap.git_restore,
             "branch" => self.wrap.git_branch_delete,
+            "commit" => self.wrap.git_commit_amend,
+            "rebase" => self.wrap.git_rebase,
+            "stash" => self.wrap.git_stash,
+            "merge" => self.wrap.git_rebase,
             _ => false,
         }
     }
@@ -194,8 +250,19 @@ impl Config {
             "wrap.git_checkout" => bool_at(&mut self.wrap.git_checkout)?,
             "wrap.git_restore" => bool_at(&mut self.wrap.git_restore)?,
             "wrap.git_branch_delete" => bool_at(&mut self.wrap.git_branch_delete)?,
+            "wrap.git_commit_amend" => bool_at(&mut self.wrap.git_commit_amend)?,
+            "wrap.git_rebase" => bool_at(&mut self.wrap.git_rebase)?,
+            "wrap.git_stash" => bool_at(&mut self.wrap.git_stash)?,
             "trash.retention_days" => u64_at(&mut self.trash.retention_days)?,
             "trash.max_bytes" => u64_at(&mut self.trash.max_bytes)?,
+            "trash.exclude_patterns" => {
+                self.trash.exclude_patterns = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+            }
             "journal.keep_days" => u64_at(&mut self.journal.keep_days)?,
             "git.snapshot_untracked" => bool_at(&mut self.git.snapshot_untracked)?,
             "git.keep_refs" => bool_at(&mut self.git.keep_refs)?,
@@ -222,8 +289,12 @@ impl Config {
             "wrap.git_checkout",
             "wrap.git_restore",
             "wrap.git_branch_delete",
+            "wrap.git_commit_amend",
+            "wrap.git_rebase",
+            "wrap.git_stash",
             "trash.retention_days",
             "trash.max_bytes",
+            "trash.exclude_patterns",
             "journal.keep_days",
             "git.snapshot_untracked",
             "git.keep_refs",

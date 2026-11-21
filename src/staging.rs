@@ -28,8 +28,12 @@ use crate::paths::Paths;
 pub enum SnapshotMode {
     /// Full recursive copy; safe when the original may be rewritten in place.
     Copy,
-    /// Hard-link regular files where possible; safe only when the original
-    /// will be unlinked (never rewritten in place).
+    /// Copy-on-write clone (using Linux FICLONE or macOS clonefile) falling
+    /// back to independent copy. Guarantees snapshot isolation against
+    /// concurrent or subsequent writes to the source file (SEC-004).
+    Clone,
+    /// Deprecated synonym for `Clone`. Retained for backwards compatibility.
+    /// Never uses ordinary hard links for mutable snapshots.
     Hardlink,
 }
 
@@ -70,7 +74,7 @@ impl<'a> Stager<'a> {
 
     fn ensure_entry_dir(&self) -> Result<PathBuf> {
         let dir = self.entry_dir();
-        fs::create_dir_all(&dir).path_context(&dir)?;
+        crate::paths::create_private_dir(&dir)?;
         Ok(dir)
     }
 
@@ -101,7 +105,18 @@ impl<'a> Stager<'a> {
         let stored = self.next_path(base);
         let size = tree_size(origin)?;
 
-        match fs::rename(origin, &stored) {
+        #[cfg(test)]
+        let force_exdev = std::env::var_os("REWIND_TEST_FORCE_EXDEV").is_some();
+        #[cfg(not(test))]
+        let force_exdev = false;
+
+        let rename_res = if force_exdev {
+            Err(std::io::Error::from_raw_os_error(18)) // simulate EXDEV in tests
+        } else {
+            fs::rename(origin, &stored)
+        };
+
+        match rename_res {
             Ok(()) => Ok(StagedPayload { stored, size }),
             Err(err) if is_cross_device(&err) => {
                 copy_tree(origin, &stored)?;
@@ -120,7 +135,7 @@ impl<'a> Stager<'a> {
         let stored = self.next_path(base);
         let size = match mode {
             SnapshotMode::Copy => copy_tree(origin, &stored)?,
-            SnapshotMode::Hardlink => link_tree(origin, &stored)?,
+            SnapshotMode::Clone | SnapshotMode::Hardlink => clone_tree(origin, &stored)?,
         };
         Ok(StagedPayload { stored, size })
     }
@@ -230,7 +245,18 @@ pub fn move_path(from: &Path, to: &Path, overwrite: bool) -> Result<()> {
         remove_tree(to)?;
     }
 
-    match fs::rename(from, to) {
+    #[cfg(test)]
+    let force_exdev = std::env::var_os("REWIND_TEST_FORCE_EXDEV").is_some();
+    #[cfg(not(test))]
+    let force_exdev = false;
+
+    let rename_res = if force_exdev {
+        Err(std::io::Error::from_raw_os_error(18)) // simulated EXDEV in tests
+    } else {
+        fs::rename(from, to)
+    };
+
+    match rename_res {
         Ok(()) => Ok(()),
         Err(err) if is_cross_device(&err) => {
             copy_tree(from, to)?;
@@ -253,38 +279,215 @@ pub fn absolutize(path: &Path) -> Result<PathBuf> {
 }
 
 fn is_cross_device(err: &std::io::Error) -> bool {
+    #[cfg(test)]
+    if std::env::var_os("REWIND_TEST_FORCE_EXDEV").is_some() {
+        return true;
+    }
     err.kind() == ErrorKind::CrossesDevices
         || err.raw_os_error() == Some(18) // EXDEV on Linux/macOS
         || err.raw_os_error() == Some(17) // EXDEV on some BSDs
 }
 
-/// Recursively copy preserving modes, symlinks, and timestamps. Returns the
-/// number of bytes copied.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafeFileType {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+#[cfg(unix)]
+fn safe_file_type_from_mode(mode: libc::mode_t) -> SafeFileType {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => SafeFileType::Dir,
+        libc::S_IFREG => SafeFileType::File,
+        libc::S_IFLNK => SafeFileType::Symlink,
+        _ => SafeFileType::Other,
+    }
+}
+
+#[cfg(unix)]
+fn open_file_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
+
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn create_file_nofollow(path: &Path, truncate: bool) -> std::io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
+
+    let flags = if truncate {
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    } else {
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    };
+
+    let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o666) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn read_dir_nofollow(path: &Path) -> Result<Vec<(String, SafeFileType, u64)>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::InvalidInput(format!("path contains null byte: {}", path.display())))?;
+
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(crate::error::io_err(path, std::io::Error::last_os_error()));
+    }
+
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        unsafe { libc::close(fd) };
+        return Err(crate::error::io_err(path, std::io::Error::last_os_error()));
+    }
+
+    let mut entries = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            break;
+        }
+
+        let name_ptr = unsafe { (*entry).d_name.as_ptr() };
+        let name_bytes = unsafe { std::ffi::CStr::from_ptr(name_ptr).to_bytes() };
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                unsafe { libc::closedir(dir) };
+                return Err(Error::InvalidInput(format!(
+                    "directory entry in {} is not valid UTF-8",
+                    path.display()
+                )));
+            }
+        };
+
+        let cur_dfd = unsafe { libc::dirfd(dir) };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let stat_res = unsafe {
+            libc::fstatat(
+                cur_dfd,
+                name_ptr,
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_res != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::NotFound {
+                continue;
+            }
+            unsafe { libc::closedir(dir) };
+            return Err(crate::error::io_err(path.join(&name), err));
+        }
+
+        let st = unsafe { st.assume_init() };
+        let file_type = safe_file_type_from_mode(st.st_mode);
+        let size = if file_type == SafeFileType::File {
+            st.st_size.max(0) as u64
+        } else {
+            0
+        };
+        entries.push((name, file_type, size));
+    }
+
+    unsafe { libc::closedir(dir) };
+    Ok(entries)
+}
+
+/// Recursively copy preserving modes, symlinks, and timestamps without following
+/// symlinks. Returns the number of bytes copied. Cleans up partial destinations on error.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<u64> {
+    match copy_tree_inner(src, dst) {
+        Ok(size) => Ok(size),
+        Err(err) => {
+            let _ = remove_tree(dst);
+            Err(err)
+        }
+    }
+}
+
+fn copy_tree_inner(src: &Path, dst: &Path) -> Result<u64> {
     let meta = fs::symlink_metadata(src).path_context(src)?;
     let file_type = meta.file_type();
 
     if file_type.is_symlink() {
         let target = fs::read_link(src).path_context(src)?;
+        if dst.symlink_metadata().is_ok() {
+            remove_tree(dst)?;
+        }
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, dst).path_context(dst)?;
         #[cfg(not(unix))]
         {
-            // Non-Unix platforms are not a primary target; copy through.
             fs::copy(src, dst).path_context(dst)?;
         }
         return Ok(meta.len());
     }
 
     if file_type.is_dir() {
-        fs::create_dir_all(dst).path_context(dst)?;
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).path_context(parent)?;
+        }
+        if !dst.exists() {
+            fs::create_dir(dst).path_context(dst)?;
+        }
+
         let mut total = 0u64;
-        let entries = fs::read_dir(src).path_context(src)?;
-        for entry in entries {
-            let entry = entry.path_context(src)?;
-            let child_src = entry.path();
-            let name = entry.file_name();
-            total = total.saturating_add(copy_tree(&child_src, &dst.join(name))?);
+        #[cfg(unix)]
+        {
+            let entries = read_dir_nofollow(src)?;
+            for (name, _, _) in entries {
+                let child_src = src.join(&name);
+                let child_dst = dst.join(&name);
+                total = total.saturating_add(copy_tree_inner(&child_src, &child_dst)?);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let entries = fs::read_dir(src).path_context(src)?;
+            for entry in entries {
+                let entry = entry.path_context(src)?;
+                let child_src = entry.path();
+                let name = entry.file_name();
+                total = total.saturating_add(copy_tree_inner(&child_src, &dst.join(name))?);
+            }
         }
         copy_permissions(&meta, dst)?;
         copy_times(&meta, dst);
@@ -292,7 +495,20 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<u64> {
     }
 
     if file_type.is_file() {
+        #[cfg(unix)]
+        let copied = {
+            use std::io::{BufReader, BufWriter, Write};
+            let src_file = open_file_nofollow(src).path_context(src)?;
+            let dst_file = create_file_nofollow(dst, true).path_context(dst)?;
+            let mut reader = BufReader::with_capacity(128 * 1024, src_file);
+            let mut writer = BufWriter::with_capacity(128 * 1024, dst_file);
+            let n = std::io::copy(&mut reader, &mut writer).path_context(src)?;
+            writer.flush().path_context(dst)?;
+            n
+        };
+        #[cfg(not(unix))]
         let copied = fs::copy(src, dst).path_context(src)?;
+
         copy_permissions(&meta, dst)?;
         copy_times(&meta, dst);
         return Ok(copied);
@@ -309,14 +525,87 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<u64> {
     }
 }
 
-/// Like [`copy_tree`], but hard-links regular files. Only safe when the source
-/// will be unlinked rather than rewritten.
-fn link_tree(src: &Path, dst: &Path) -> Result<u64> {
+/// Clones a regular file using Copy-on-Write (CoW) extents where supported, falling
+/// back to an independent byte copy. Never uses ordinary hard links, ensuring snapshot
+/// isolation even if the source file is modified concurrently or subsequently (SEC-004).
+pub fn clone_file_isolated(src: &Path, dst: &Path, meta: &fs::Metadata) -> Result<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        if let (Ok(src_c), Ok(dst_c)) = (
+            CString::new(src.as_os_str().as_bytes()),
+            CString::new(dst.as_os_str().as_bytes()),
+        ) {
+            extern "C" {
+                fn clonefile(
+                    src: *const libc::c_char,
+                    dst: *const libc::c_char,
+                    flags: u32,
+                ) -> libc::c_int;
+            }
+            if dst.symlink_metadata().is_ok() {
+                let _ = fs::remove_file(dst);
+            }
+            const CLONE_NOFOLLOW: u32 = 0x0001;
+            let res = unsafe { clonefile(src_c.as_ptr(), dst_c.as_ptr(), CLONE_NOFOLLOW) };
+            if res == 0 {
+                return Ok(meta.len());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let src_file = open_file_nofollow(src).path_context(src)?;
+        let dst_file = create_file_nofollow(dst, true).path_context(dst)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            const FICLONE: libc::c_ulong = 0x40049409;
+            let res = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+            if res == 0 {
+                copy_permissions(meta, dst)?;
+                copy_times(meta, dst);
+                return Ok(meta.len());
+            }
+        }
+
+        let copied = {
+            use std::io::{BufReader, BufWriter, Write};
+            let mut reader = BufReader::with_capacity(128 * 1024, src_file);
+            let mut writer = BufWriter::with_capacity(128 * 1024, dst_file);
+            let n = std::io::copy(&mut reader, &mut writer).path_context(src)?;
+            writer.flush().path_context(dst)?;
+            n
+        };
+        copy_permissions(meta, dst)?;
+        copy_times(meta, dst);
+        Ok(copied)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let copied = fs::copy(src, dst).path_context(src)?;
+        copy_permissions(meta, dst)?;
+        copy_times(meta, dst);
+        Ok(copied)
+    }
+}
+
+/// Recursively clone a tree using Copy-on-Write cloning or independent copying.
+/// Unlike ordinary hard links, this guarantees snapshot isolation even if source files
+/// are modified concurrently or after staging (SEC-004).
+pub fn clone_tree(src: &Path, dst: &Path) -> Result<u64> {
     let meta = fs::symlink_metadata(src).path_context(src)?;
     let file_type = meta.file_type();
 
     if file_type.is_symlink() {
         let target = fs::read_link(src).path_context(src)?;
+        if dst.symlink_metadata().is_ok() {
+            remove_tree(dst)?;
+        }
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, dst).path_context(dst)?;
         #[cfg(not(unix))]
@@ -325,86 +614,269 @@ fn link_tree(src: &Path, dst: &Path) -> Result<u64> {
     }
 
     if file_type.is_dir() {
-        fs::create_dir_all(dst).path_context(dst)?;
-        let mut total = 0u64;
-        for entry in fs::read_dir(src).path_context(src)? {
-            let entry = entry.path_context(src)?;
-            let name = entry.file_name();
-            total = total.saturating_add(link_tree(&entry.path(), &dst.join(name))?);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).path_context(parent)?;
         }
+        if !dst.exists() {
+            fs::create_dir(dst).path_context(dst)?;
+        }
+        let mut total = 0u64;
+        #[cfg(unix)]
+        {
+            let entries = read_dir_nofollow(src)?;
+            for (name, _, _) in entries {
+                let child_src = src.join(&name);
+                let child_dst = dst.join(&name);
+                total = total.saturating_add(clone_tree(&child_src, &child_dst)?);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for entry in fs::read_dir(src).path_context(src)? {
+                let entry = entry.path_context(src)?;
+                let name = entry.file_name();
+                total = total.saturating_add(clone_tree(&entry.path(), &dst.join(name))?);
+            }
+        }
+        copy_permissions(&meta, dst)?;
+        copy_times(&meta, dst);
         return Ok(total);
     }
 
     if file_type.is_file() {
-        match fs::hard_link(src, dst) {
-            Ok(()) => Ok(meta.len()),
-            Err(err) if is_cross_device(&err) => {
-                let copied = fs::copy(src, dst).path_context(src)?;
-                copy_permissions(&meta, dst)?;
-                copy_times(&meta, dst);
-                Ok(copied)
-            }
-            Err(err) => Err(crate::error::io_err(src, err)),
-        }
+        clone_file_isolated(src, dst, &meta)
     } else {
-        match fs::hard_link(src, dst) {
-            Ok(()) => Ok(0),
-            Err(err) => Err(Error::Staging(format!(
-                "cannot snapshot special file {}: {err}",
-                src.display()
-            ))),
-        }
+        Err(Error::Staging(format!(
+            "cannot snapshot special file {}: unsupported file type",
+            src.display()
+        )))
     }
 }
 
+/// Deprecated synonym for [`clone_tree`]. Preserved for backward compatibility.
+/// Never uses ordinary hard links for mutable files.
+#[inline]
+pub fn link_tree(src: &Path, dst: &Path) -> Result<u64> {
+    clone_tree(src, dst)
+}
+
 /// Recursively delete a path without following symlinks.
+///
+/// Uses POSIX directory-descriptor relative traversal (`openat`/`unlinkat`) with
+/// `O_NOFOLLOW` so that symlinks inside the tree are unlinked without traversing their
+/// targets, and intermediate path component swaps cannot escape the deletion boundary.
 pub fn remove_tree(path: &Path) -> Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(crate::error::io_err(path, err)),
     };
-    if meta.file_type().is_dir() {
+
+    if !meta.file_type().is_dir() {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(crate::error::io_err(path, err)),
+        };
+    }
+
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            Error::InvalidInput(format!("path contains null byte: {}", path.display()))
+        })?;
+
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ELOOP)
+                || err.raw_os_error() == Some(libc::EMLINK)
+                || err.raw_os_error() == Some(libc::ENOTDIR)
+            {
+                // Replaced with a symlink or non-directory: unlink the leaf itself; do not follow.
+                return match fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(crate::error::io_err(path, e)),
+                };
+            }
+            if err.kind() == ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(crate::error::io_err(path, err));
+        }
+
+        unsafe { remove_dir_contents_fd(fd, path)? };
+
+        match fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(crate::error::io_err(path, err)),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
         for entry in fs::read_dir(path).path_context(path)? {
             let entry = entry.path_context(path)?;
             remove_tree(&entry.path())?;
         }
         fs::remove_dir(path).path_context(path)?;
-    } else {
-        fs::remove_file(path).path_context(path)?;
+        Ok(())
     }
-    Ok(())
 }
 
-/// Total logical size of a tree.
+#[cfg(unix)]
+unsafe fn remove_dir_contents_fd(dfd: libc::c_int, context_path: &Path) -> Result<()> {
+    let dir = unsafe { libc::fdopendir(dfd) };
+    if dir.is_null() {
+        unsafe { libc::close(dfd) };
+        return Err(crate::error::io_err(
+            context_path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    let mut last_err = None;
+
+    loop {
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            break;
+        }
+
+        let name_ptr = unsafe { (*entry).d_name.as_ptr() };
+        let name_bytes = unsafe { std::ffi::CStr::from_ptr(name_ptr).to_bytes() };
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let cur_dfd = unsafe { libc::dirfd(dir) };
+
+        let sub_fd = unsafe {
+            libc::openat(
+                cur_dfd,
+                name_ptr,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+
+        if sub_fd >= 0 {
+            if let Err(e) = unsafe { remove_dir_contents_fd(sub_fd, context_path) } {
+                last_err = Some(e);
+            }
+            if unsafe { libc::unlinkat(cur_dfd, name_ptr, libc::AT_REMOVEDIR) } != 0 {
+                let mut err = std::io::Error::last_os_error();
+                if err.kind() == ErrorKind::PermissionDenied {
+                    let _ = unsafe { libc::fchmod(cur_dfd, 0o700) };
+                    if unsafe { libc::unlinkat(cur_dfd, name_ptr, libc::AT_REMOVEDIR) } == 0 {
+                        err = std::io::Error::from_raw_os_error(0);
+                    } else {
+                        err = std::io::Error::last_os_error();
+                    }
+                }
+                if err.raw_os_error() != Some(0) && err.kind() != ErrorKind::NotFound {
+                    last_err = Some(crate::error::io_err(context_path, err));
+                }
+            }
+        } else if unsafe { libc::unlinkat(cur_dfd, name_ptr, 0) } != 0 {
+            let mut err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::PermissionDenied {
+                let _ = unsafe { libc::fchmod(cur_dfd, 0o700) };
+                if unsafe { libc::unlinkat(cur_dfd, name_ptr, 0) } == 0 {
+                    err = std::io::Error::from_raw_os_error(0);
+                } else {
+                    err = std::io::Error::last_os_error();
+                }
+            }
+            if err.raw_os_error() != Some(0) && err.kind() != ErrorKind::NotFound {
+                last_err = Some(crate::error::io_err(context_path, err));
+            }
+        }
+    }
+
+    unsafe { libc::closedir(dir) };
+
+    if let Some(err) = last_err {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+/// Total logical size of a tree without traversing symlinks.
 pub fn tree_size(path: &Path) -> Result<u64> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
         Err(err) => return Err(crate::error::io_err(path, err)),
     };
-    if meta.file_type().is_dir() {
+    if meta.file_type().is_symlink() {
+        Ok(0)
+    } else if meta.file_type().is_dir() {
         let mut total = 0u64;
-        for entry in fs::read_dir(path).path_context(path)? {
-            let entry = entry.path_context(path)?;
-            total = total.saturating_add(tree_size(&entry.path())?);
+        #[cfg(unix)]
+        {
+            match read_dir_nofollow(path) {
+                Ok(entries) => {
+                    for (name, file_type, size) in entries {
+                        match file_type {
+                            SafeFileType::File => {
+                                total = total.saturating_add(size);
+                            }
+                            SafeFileType::Dir => {
+                                total = total.saturating_add(tree_size(&path.join(name))?);
+                            }
+                            SafeFileType::Symlink | SafeFileType::Other => {}
+                        }
+                    }
+                }
+                Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ELOOP) => {
+                    return Ok(0);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for entry in fs::read_dir(path).path_context(path)? {
+                let entry = entry.path_context(path)?;
+                total = total.saturating_add(tree_size(&entry.path())?);
+            }
         }
         Ok(total)
-    } else if meta.file_type().is_symlink() {
-        Ok(0)
     } else {
         Ok(meta.len())
     }
 }
 
 fn copy_permissions(meta: &fs::Metadata, dst: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        if meta.file_type().is_symlink() {
+            return Ok(());
+        }
+    }
     let perms = meta.permissions();
     fs::set_permissions(dst, perms).path_context(dst)
 }
 
 fn copy_times(meta: &fs::Metadata, dst: &Path) {
-    // Best-effort: timestamps are nice for undo fidelity but not worth failing
-    // an otherwise successful restore.
+    #[cfg(unix)]
+    {
+        if meta.file_type().is_symlink() {
+            return;
+        }
+    }
     let atime = filetime::FileTime::from_last_access_time(meta);
     let mtime = filetime::FileTime::from_last_modification_time(meta);
     let _ = filetime::set_file_times(dst, atime, mtime);
@@ -513,5 +985,109 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("a", dir.path().join("link")).unwrap();
         assert_eq!(tree_size(dir.path()).unwrap(), 4);
+    }
+
+    #[test]
+    fn remove_tree_does_not_follow_symlink_to_external_target() {
+        let dir = tempdir().unwrap();
+        let external = dir.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        let secret = external.join("secret.txt");
+        fs::write(&secret, b"super secret").unwrap();
+
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let link = victim.join("link_to_external");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+
+        remove_tree(&victim).unwrap();
+        assert!(!victim.exists());
+        assert!(external.exists());
+        assert_eq!(fs::read(&secret).unwrap(), b"super secret");
+    }
+
+    #[test]
+    fn remove_tree_handles_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let dangling = victim.join("dangling");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("nonexistent"), &dangling).unwrap();
+
+        remove_tree(&victim).unwrap();
+        assert!(!victim.exists());
+    }
+
+    #[test]
+    fn remove_tree_handles_readonly_directory() {
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("readonly_dir");
+        fs::create_dir_all(&victim).unwrap();
+        let file = victim.join("data.txt");
+        fs::write(&file, b"content").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&victim, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+
+        remove_tree(&victim).unwrap();
+        assert!(!victim.exists());
+    }
+
+    #[test]
+    fn copy_tree_preserves_symlink_without_traversing() {
+        let dir = tempdir().unwrap();
+        let external = dir.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("file.txt"), b"outside").unwrap();
+
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let link = src.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+
+        let dest = dir.path().join("dest");
+        let size = copy_tree(&src, &dest).unwrap();
+        assert_eq!(size, external.as_os_str().len() as u64);
+        assert!(!dest.join("file.txt").exists());
+
+        #[cfg(unix)]
+        {
+            let dest_link = dest.join("link");
+            let meta = fs::symlink_metadata(&dest_link).unwrap();
+            assert!(meta.file_type().is_symlink());
+            assert_eq!(fs::read_link(&dest_link).unwrap(), external);
+        }
+    }
+
+    #[test]
+    fn cross_device_forced_exdev_seam_works() {
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        paths.ensure().unwrap();
+
+        let file = dir.path().join("file.txt");
+        fs::write(&file, b"cross-device payload").unwrap();
+
+        unsafe {
+            std::env::set_var("REWIND_TEST_FORCE_EXDEV", "1");
+        }
+        let stager = Stager::new(&paths, 99);
+        let payload = stager.stage_move(&file).unwrap();
+        assert!(!file.exists());
+        assert_eq!(fs::read(&payload.stored).unwrap(), b"cross-device payload");
+
+        stager.restore(&payload.stored, &file, false).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"cross-device payload");
+        assert!(!payload.stored.exists());
+
+        unsafe {
+            std::env::remove_var("REWIND_TEST_FORCE_EXDEV");
+        }
     }
 }

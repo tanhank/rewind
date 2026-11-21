@@ -10,6 +10,7 @@ use std::env;
 
 use serde_json::json;
 
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::journal::{EntryStatus, Journal, NewStaged, StagedKind};
 use crate::paths::Paths;
@@ -26,7 +27,12 @@ struct Plan {
     moved: bool,
 }
 
-pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<i32> {
+pub fn execute(
+    journal: &mut Journal,
+    paths: &Paths,
+    config: &Config,
+    argv: &[String],
+) -> Result<i32> {
     let Parsed::Run(parsed) = transfer::parse(argv, "mv") else {
         return run_passthrough("mv", argv);
     };
@@ -35,9 +41,31 @@ pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<
         _ => return run_passthrough("mv", argv),
     };
 
+    let _lock = paths.lock_shared(std::time::Duration::from_secs(30))?;
     let cwd = current_dir()?;
     let entry_id = journal.begin_entry("mv", argv, &cwd)?;
     let stager = Stager::new(paths, entry_id);
+
+    let mut estimated_incoming = 0u64;
+    for pair in &pairs {
+        if pair.dest.symlink_metadata().is_ok()
+            && pair.src.symlink_metadata().is_ok()
+            && !parsed.no_clobber
+            && !config.trash.is_excluded(&pair.dest)
+        {
+            estimated_incoming = estimated_incoming
+                .saturating_add(crate::staging::tree_size(&pair.dest).unwrap_or(0));
+        }
+    }
+    if let Err(err) = journal.reserve_capacity(
+        entry_id,
+        estimated_incoming,
+        config.trash.max_bytes,
+        config.trash.retention_days,
+    ) {
+        journal.delete_entry(entry_id)?;
+        return Err(err);
+    }
 
     let mut plans: Vec<Plan> = Vec::new();
     let mut snapshot_failures = 0usize;
@@ -49,7 +77,8 @@ pub fn execute(journal: &mut Journal, paths: &Paths, argv: &[String]) -> Result<
 
         // Missing sources make mv fail before touching the destination, so
         // there is nothing to protect and nothing to journal.
-        if dest_existed && src_exists && !parsed.no_clobber {
+        if dest_existed && src_exists && !parsed.no_clobber && !config.trash.is_excluded(&pair.dest)
+        {
             match stager.snapshot(&pair.dest, SnapshotMode::Copy) {
                 Ok(payload) => {
                     let item = NewStaged::new(

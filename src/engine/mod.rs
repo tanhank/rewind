@@ -7,6 +7,7 @@
 //! undo strategy is a rename into the trash, which the real `rm` cannot be
 //! asked to do.
 
+pub mod args;
 pub mod chmod;
 pub mod chown;
 pub mod cp;
@@ -33,9 +34,9 @@ pub fn dispatch(
     argv: &[String],
 ) -> Result<i32> {
     match command {
-        "rm" => rm::execute(journal, paths, argv),
-        "mv" => mv::execute(journal, paths, argv),
-        "cp" => cp::execute(journal, paths, argv),
+        "rm" => rm::execute(journal, paths, config, argv),
+        "mv" => mv::execute(journal, paths, config, argv),
+        "cp" => cp::execute(journal, paths, config, argv),
         "chmod" => chmod::execute(journal, paths, argv),
         "chown" => chown::execute(journal, paths, argv),
         "git" => git::execute(journal, paths, config, argv),
