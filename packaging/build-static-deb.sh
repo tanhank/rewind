@@ -36,10 +36,12 @@ stage=$(mktemp -d)
 chmod 755 "$stage"
 trap 'rm -rf "$stage"' EXIT
 
-install -Dm755 "$binary" "$stage/usr/bin/rewind"
-install -Dm644 "$root/shell/bash.sh" "$stage/usr/share/rewind/bash.sh"
-install -Dm644 "$root/shell/zsh.sh" "$stage/usr/share/rewind/zsh.sh"
-install -Dm644 "$root/shell/fish.fish" "$stage/usr/share/rewind/fish.fish"
+install -d "$stage/usr/bin"
+install -m 755 "$binary" "$stage/usr/bin/rewind"
+install -d "$stage/usr/share/rewind"
+install -m 644 "$root/shell/bash.sh" "$stage/usr/share/rewind/bash.sh"
+install -m 644 "$root/shell/zsh.sh" "$stage/usr/share/rewind/zsh.sh"
+install -m 644 "$root/shell/fish.fish" "$stage/usr/share/rewind/fish.fish"
 
 install -d "$stage/usr/share/man/man1"
 gzip -9cn "$root/docs/rewind.1" > "$stage/usr/share/man/man1/rewind.1.gz"
@@ -56,7 +58,7 @@ install -d "$docdir"
 gzip -9cn "$root/README.md" > "$docdir/README.md.gz"
 gzip -9cn "$root/CHANGELOG.md" > "$docdir/CHANGELOG.md.gz"
 gzip -9cn "$root/CONTRIBUTING.md" > "$docdir/CONTRIBUTING.md.gz"
-install -Dm644 "$root/debian/copyright" "$docdir/copyright"
+install -m 644 "$root/debian/copyright" "$docdir/copyright"
 
 size=$(du -sk "$stage/usr" | cut -f1)
 install -d "$stage/DEBIAN"
