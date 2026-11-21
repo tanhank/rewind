@@ -68,25 +68,17 @@ pub fn get_process_start_time(pid: u32) -> Option<u64> {
 pub fn get_process_start_time(pid: u32) -> Option<u64> {
     use std::mem;
     unsafe {
-        let mut mib = [
-            libc::CTL_KERN,
-            libc::KERN_PROC,
-            libc::KERN_PROC_PID,
+        let mut proc_info: libc::proc_bsdinfo = mem::zeroed();
+        let size = mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let ret = libc::proc_pidinfo(
             pid as libc::c_int,
-        ];
-        let mut proc: libc::kinfo_proc = mem::zeroed();
-        let mut size = mem::size_of::<libc::kinfo_proc>();
-        if libc::sysctl(
-            mib.as_mut_ptr(),
-            4,
-            &mut proc as *mut _ as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
+            libc::PROC_PIDTBSDINFO,
             0,
-        ) == 0
-            && size > 0
-        {
-            Some(proc.kp_proc.p_un.__p_starttime.tv_sec as u64)
+            &mut proc_info as *mut _ as *mut libc::c_void,
+            size,
+        );
+        if ret == size {
+            Some(proc_info.pbi_start_tvsec)
         } else {
             None
         }

@@ -6,7 +6,6 @@ rust-version = "1.89"
 description = "Universal undo for destructive shell commands (rm, mv, cp, chmod, chown, git)"
 license = "MIT"
 repository = "https://github.com/tanhank/rewind"
-homepage = "https://github.com/tanhank/rewind"
 documentation = "https://github.com/tanhank/rewind#readme"
 readme = "README.md"
 keywords = ["undo", "trash", "shell", "cli", "recovery"]

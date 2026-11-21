@@ -557,12 +557,12 @@ pub fn clone_file_isolated(src: &Path, dst: &Path, meta: &fs::Metadata) -> Resul
 
     #[cfg(unix)]
     {
-        use std::os::unix::io::AsRawFd;
         let src_file = open_file_nofollow(src).path_context(src)?;
         let dst_file = create_file_nofollow(dst, true).path_context(dst)?;
 
         #[cfg(target_os = "linux")]
         {
+            use std::os::unix::io::AsRawFd;
             const FICLONE: libc::c_ulong = 0x40049409;
             let res = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
             if res == 0 {
